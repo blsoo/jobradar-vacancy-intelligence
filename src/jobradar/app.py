@@ -39,7 +39,7 @@ def collect(settings: Settings, store: VacancyStore) -> int:
 
 
 def push_new(settings: Settings, store: VacancyStore, telegram: TelegramClient) -> int:
-    if not telegram.enabled:
+    if not telegram.can_send:
         return 0
     queue = store.unsent(settings.score_threshold, settings.max_push_per_cycle)
     sent = 0
@@ -50,11 +50,15 @@ def push_new(settings: Settings, store: VacancyStore, telegram: TelegramClient) 
     return sent
 
 
-def _authorized_chat(settings: Settings, update: dict) -> bool:
+def _chat_id_from_update(update: dict) -> str:
     callback = update.get("callback_query") or {}
     message = callback.get("message") or update.get("message") or {}
     chat = message.get("chat") or {}
-    return str(chat.get("id", "")) == str(settings.telegram_chat_id)
+    return str(chat.get("id", ""))
+
+
+def _authorized_chat(telegram: TelegramClient, update: dict) -> bool:
+    return bool(telegram.chat_id) and _chat_id_from_update(update) == str(telegram.chat_id)
 
 
 def _stats_text(store: VacancyStore) -> str:
@@ -73,14 +77,34 @@ def _stats_text(store: VacancyStore) -> str:
 
 
 def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramClient, update: dict) -> None:
-    if not _authorized_chat(settings, update):
+    message = update.get("message") or {}
+    text = (message.get("text") or "").strip().lower()
+    incoming_chat_id = _chat_id_from_update(update)
+
+    # First-run bootstrap: when no chat is configured or persisted yet, the first
+    # /start claims the bot. The binding is stored in the persistent database.
+    if not telegram.chat_id:
+        if text == "/start" and incoming_chat_id:
+            telegram.bind_chat(incoming_chat_id)
+            store.set_setting("telegram_chat_id", incoming_chat_id)
+            telegram.send_text(
+                "✅ JobRadar привязан к этому чату.\n"
+                "Теперь сюда будут приходить только вакансии выше порога.\n"
+                "Команда /stats покажет текущую воронку."
+            )
+            push_new(settings, store, telegram)
+        return
+
+    if not _authorized_chat(telegram, update):
         callback = update.get("callback_query") or {}
         if callback.get("id"):
             telegram.answer_callback(callback["id"], "Нет доступа")
         return
 
-    message = update.get("message") or {}
-    text = (message.get("text") or "").strip().lower()
+    if text == "/start":
+        telegram.send_text("✅ JobRadar уже привязан к этому чату. /stats — статистика.")
+        return
+
     if text == "/stats":
         telegram.send_text(_stats_text(store))
         return
@@ -165,9 +189,18 @@ def cycle(settings: Settings, store: VacancyStore, telegram: TelegramClient) -> 
     return found, sent
 
 
+def _telegram_client(settings: Settings, store: VacancyStore) -> TelegramClient:
+    configured = settings.telegram_chat_id
+    persisted = store.get_setting("telegram_chat_id") or ""
+    chat_id = configured or persisted
+    if configured and configured != persisted:
+        store.set_setting("telegram_chat_id", configured)
+    return TelegramClient(settings.telegram_bot_token, chat_id)
+
+
 def run_once(settings: Settings) -> int:
     store = VacancyStore(settings.db_path)
-    telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
+    telegram = _telegram_client(settings, store)
     try:
         found, sent = cycle(settings, store, telegram)
         print(f"JobRadar: collected={found} pushed={sent} stats={store.stats()}")
@@ -178,9 +211,11 @@ def run_once(settings: Settings) -> int:
 
 def run_forever(settings: Settings) -> int:
     store = VacancyStore(settings.db_path)
-    telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
+    telegram = _telegram_client(settings, store)
     if not telegram.enabled:
-        print("Warning: Telegram is disabled; configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+        print("Warning: Telegram is disabled; configure TELEGRAM_BOT_TOKEN")
+    elif not telegram.chat_id:
+        print("Telegram token configured; waiting for the first /start to bind the owner chat")
 
     next_collect = 0.0
     try:

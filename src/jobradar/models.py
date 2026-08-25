@@ -12,6 +12,7 @@ class Vacancy:
     company: str
     url: str
     published_at: str
+    apply_url: str = ""
     area: str = ""
     schedule: str = ""
     experience: str = ""
@@ -40,6 +41,7 @@ class Vacancy:
             company=(item.get("employer") or {}).get("name") or "",
             url=item.get("alternate_url") or "",
             published_at=item.get("published_at") or "",
+            apply_url=item.get("apply_alternate_url") or "",
             area=(item.get("area") or {}).get("name") or "",
             schedule=(item.get("schedule") or {}).get("name") or "",
             experience=(item.get("experience") or {}).get("name") or "",
@@ -55,6 +57,10 @@ class Vacancy:
         return " ".join(
             [self.title, self.company, self.snippet, self.schedule, self.experience, *self.professional_roles]
         ).lower()
+
+    @property
+    def application_url(self) -> str:
+        return self.apply_url or self.url
 
 
 @dataclass(frozen=True)

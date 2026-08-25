@@ -19,6 +19,8 @@ jobs:
         env:
           PYTHONPATH: src
         run: python -m unittest discover -s tests -v
+      - name: Build container
+        run: docker build -t jobradar:test .
       - name: Public safety check
         run: |
           ! grep -RIE --exclude-dir=.git --exclude='.env.example' '([A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|API_KEY)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]+)' .

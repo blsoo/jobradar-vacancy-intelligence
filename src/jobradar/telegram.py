@@ -8,7 +8,7 @@ from .models import RankedVacancy
 
 
 class TelegramClient:
-    def __init__(self, token: str, chat_id: str, timeout: int = 20) -> None:
+    def __init__(self, token: str, chat_id: str = "", timeout: int = 20) -> None:
         self.token = token
         self.chat_id = chat_id
         self.timeout = timeout
@@ -16,7 +16,14 @@ class TelegramClient:
 
     @property
     def enabled(self) -> bool:
+        return bool(self.token)
+
+    @property
+    def can_send(self) -> bool:
         return bool(self.token and self.chat_id)
+
+    def bind_chat(self, chat_id: str) -> None:
+        self.chat_id = str(chat_id)
 
     def _call(self, method: str, payload: dict | None = None) -> dict:
         if not self.token:
@@ -33,6 +40,12 @@ class TelegramClient:
         if not result.get("ok"):
             raise RuntimeError(f"Telegram API error: {result}")
         return result
+
+    def _target(self, chat_id: str | None = None) -> str:
+        target = str(chat_id or self.chat_id or "")
+        if not target:
+            raise RuntimeError("Telegram chat is not bound yet")
+        return target
 
     @staticmethod
     def _salary_text(item: RankedVacancy) -> str:
@@ -75,7 +88,7 @@ class TelegramClient:
         self._call(
             "sendMessage",
             {
-                "chat_id": self.chat_id,
+                "chat_id": self._target(),
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
@@ -83,8 +96,8 @@ class TelegramClient:
             },
         )
 
-    def send_text(self, text: str, *, reply_markup: dict | None = None) -> None:
-        payload = {"chat_id": self.chat_id, "text": text, "disable_web_page_preview": True}
+    def send_text(self, text: str, *, reply_markup: dict | None = None, chat_id: str | None = None) -> None:
+        payload = {"chat_id": self._target(chat_id), "text": text, "disable_web_page_preview": True}
         if reply_markup:
             payload["reply_markup"] = reply_markup
         self._call("sendMessage", payload)

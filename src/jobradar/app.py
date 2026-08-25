@@ -12,6 +12,15 @@ from .storage import VacancyStore
 from .telegram import TelegramClient
 
 
+SKIP_REASONS = {
+    "salary": "зарплата",
+    "office": "офис / география",
+    "seniority": "слишком высокий уровень",
+    "stack": "не мой стек",
+    "other": "другое",
+}
+
+
 def collect(settings: Settings, store: VacancyStore) -> int:
     client = HHClient(settings.hh_user_agent)
     vacancies = client.search_many(
@@ -48,6 +57,21 @@ def _authorized_chat(settings: Settings, update: dict) -> bool:
     return str(chat.get("id", "")) == str(settings.telegram_chat_id)
 
 
+def _stats_text(store: VacancyStore) -> str:
+    stats = store.stats()
+    reasons = store.skip_reason_stats()
+    reason_text = ", ".join(f"{SKIP_REASONS.get(k, k)}: {v}" for k, v in list(reasons.items())[:4])
+    return (
+        "📊 JobRadar\n"
+        f"Вакансий в базе: {stats['total']}\n"
+        f"Отправлено: {stats['sent']}\n"
+        f"Сохранено: {stats['saved']}\n"
+        f"К отклику: {stats['apply_requested']}\n"
+        f"Пропущено: {stats['skipped']}"
+        + (f"\nПричины пропуска: {reason_text}" if reason_text else "")
+    )
+
+
 def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramClient, update: dict) -> None:
     if not _authorized_chat(settings, update):
         callback = update.get("callback_query") or {}
@@ -58,30 +82,21 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
     message = update.get("message") or {}
     text = (message.get("text") or "").strip().lower()
     if text == "/stats":
-        stats = store.stats()
-        telegram.send_text(
-            "📊 JobRadar\n"
-            f"Вакансий в базе: {stats['total']}\n"
-            f"Отправлено: {stats['sent']}\n"
-            f"Сохранено: {stats['saved']}\n"
-            f"К отклику: {stats['apply_requested']}\n"
-            f"Пропущено: {stats['skipped']}"
-        )
+        telegram.send_text(_stats_text(store))
         return
 
     callback = update.get("callback_query") or {}
     data = callback.get("data") or ""
     callback_id = callback.get("id")
-    if not data or ":" not in data:
-        return
-
-    action, raw_id = data.split(":", 1)
-    if not raw_id.isdigit():
-        if callback_id:
+    parts = data.split(":") if data else []
+    if len(parts) < 2 or not parts[1].isdigit():
+        if callback_id and data:
             telegram.answer_callback(callback_id, "Некорректная команда")
         return
 
-    local_id = int(raw_id)
+    action = parts[0]
+    local_id = int(parts[1])
+    extra = parts[2] if len(parts) > 2 else None
     item = store.get(local_id)
     if item is None:
         if callback_id:
@@ -94,8 +109,28 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         return
 
     if action == "skip":
-        store.decide(local_id, "skipped")
-        telegram.answer_callback(callback_id, "❌ Пропущено")
+        telegram.answer_callback(callback_id, "Почему пропускаем?")
+        telegram.send_text(
+            f"❌ Почему не подходит «{item.vacancy.title}»?",
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {"text": "💸 Зарплата", "callback_data": f"skipr:{local_id}:salary"},
+                        {"text": "🏢 Офис", "callback_data": f"skipr:{local_id}:office"},
+                    ],
+                    [
+                        {"text": "📈 Seniority", "callback_data": f"skipr:{local_id}:seniority"},
+                        {"text": "🧩 Стек", "callback_data": f"skipr:{local_id}:stack"},
+                    ],
+                    [{"text": "Другое", "callback_data": f"skipr:{local_id}:other"}],
+                ]
+            },
+        )
+        return
+
+    if action == "skipr" and extra in SKIP_REASONS:
+        store.decide(local_id, "skipped", reason=extra)
+        telegram.answer_callback(callback_id, f"❌ Учёл: {SKIP_REASONS[extra]}")
         return
 
     if action == "apply":
@@ -105,10 +140,10 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         telegram.send_text(
             "🔥 Подготовленный отклик\n\n"
             f"{letter}\n\n"
-            "После реальной отправки на HH отметь это кнопкой ниже.",
+            "Кнопка ведёт прямо в форму отклика HH, если HH отдал её для вакансии. После реальной отправки отметь это ниже.",
             reply_markup={
                 "inline_keyboard": [
-                    [{"text": "🔗 Открыть вакансию на HH", "url": item.vacancy.url}],
+                    [{"text": "⚡ Открыть форму отклика HH", "url": item.vacancy.application_url}],
                     [{"text": "✅ Я откликнулся", "callback_data": f"applied:{local_id}"}],
                 ]
             },

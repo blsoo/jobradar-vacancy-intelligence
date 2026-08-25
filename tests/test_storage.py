@@ -52,6 +52,13 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(self.store.decide(local_id, "saved"))
         self.assertEqual(self.store.decision_event_count(local_id), 1)
 
+    def test_skip_reason_is_aggregated(self):
+        first = self.store.upsert(self.ranked("1"))
+        second = self.store.upsert(self.ranked("2"))
+        self.store.decide(first, "skipped", reason="salary")
+        self.store.decide(second, "skipped", reason="salary")
+        self.assertEqual(self.store.skip_reason_stats(), {"salary": 2})
+
 
 if __name__ == "__main__":
     unittest.main()

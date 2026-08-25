@@ -38,6 +38,12 @@ CREATE TABLE IF NOT EXISTS decision_events (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS runtime_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_vacancies_queue
 ON vacancies(decision, sent_at, score DESC, created_at DESC);
 """
@@ -61,6 +67,20 @@ class VacancyStore:
 
     def close(self) -> None:
         self.conn.close()
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM runtime_settings WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO runtime_settings(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP
+            """,
+            (key, value),
+        )
+        self.conn.commit()
 
     def upsert(self, ranked: RankedVacancy) -> int:
         v = ranked.vacancy

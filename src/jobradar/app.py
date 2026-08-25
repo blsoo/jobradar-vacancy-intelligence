@@ -183,6 +183,36 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         telegram.answer_callback(callback_id, "Неизвестное действие")
 
 
+def poll_updates(
+    settings: Settings,
+    store: VacancyStore,
+    telegram: TelegramClient,
+    *,
+    timeout: int = 1,
+) -> int:
+    """Process Telegram updates exactly once across short-lived worker runs.
+
+    The next Telegram update offset is persisted in SQLite so scheduled CI jobs do
+    not re-process old callbacks when a new Python process starts.
+    """
+    if not telegram.enabled:
+        return 0
+    raw_offset = store.get_setting("telegram_update_offset") or "0"
+    try:
+        offset = max(0, int(raw_offset))
+    except ValueError:
+        offset = 0
+
+    processed = 0
+    updates = telegram.get_updates(offset=offset, timeout=timeout)
+    for update in sorted(updates, key=lambda item: int(item.get("update_id", 0))):
+        handle_update(settings, store, telegram, update)
+        update_id = int(update.get("update_id", 0))
+        store.set_setting("telegram_update_offset", str(update_id + 1))
+        processed += 1
+    return processed
+
+
 def cycle(settings: Settings, store: VacancyStore, telegram: TelegramClient) -> tuple[int, int]:
     found = collect(settings, store)
     sent = push_new(settings, store, telegram)
@@ -204,6 +234,23 @@ def run_once(settings: Settings) -> int:
     try:
         found, sent = cycle(settings, store, telegram)
         print(f"JobRadar: collected={found} pushed={sent} stats={store.stats()}")
+        return 0
+    finally:
+        store.close()
+
+
+def run_tick(settings: Settings) -> int:
+    """One complete scheduled-worker iteration for GitHub/self-hosted CI."""
+    store = VacancyStore(settings.db_path)
+    telegram = _telegram_client(settings, store)
+    try:
+        found = collect(settings, store)
+        processed = poll_updates(settings, store, telegram, timeout=0)
+        sent = push_new(settings, store, telegram)
+        print(
+            f"JobRadar tick: collected={found} telegram_updates={processed} "
+            f"pushed={sent} stats={store.stats()}"
+        )
         return 0
     finally:
         store.close()
@@ -231,8 +278,7 @@ def run_forever(settings: Settings) -> int:
 
             if telegram.enabled:
                 try:
-                    for update in telegram.get_updates(timeout=1):
-                        handle_update(settings, store, telegram, update)
+                    poll_updates(settings, store, telegram, timeout=1)
                 except Exception as exc:
                     print(f"telegram error: {exc}", file=sys.stderr)
                     time.sleep(2)
@@ -249,9 +295,11 @@ def main() -> int:
     mode = sys.argv[1].lower() if len(sys.argv) > 1 else "once"
     if mode == "once":
         return run_once(settings)
+    if mode == "tick":
+        return run_tick(settings)
     if mode == "run":
         return run_forever(settings)
-    print("Usage: python -m jobradar.app [once|run]", file=sys.stderr)
+    print("Usage: python -m jobradar.app [once|tick|run]", file=sys.stderr)
     return 2
 
 

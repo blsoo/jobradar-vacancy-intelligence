@@ -1,0 +1,11 @@
+services:
+  jobradar:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - jobradar-data:/data
+
+volumes:
+  jobradar-data:

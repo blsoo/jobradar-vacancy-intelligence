@@ -118,15 +118,20 @@ class VacancyStore:
 
     def mark_sent(self, local_id: int) -> None:
         self.conn.execute(
-            "UPDATE vacancies SET sent_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            "UPDATE vacancies SET sent_at=COALESCE(sent_at, CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (local_id,),
         )
         self.conn.commit()
 
-    def decide(self, local_id: int, decision: str) -> None:
+    def decide(self, local_id: int, decision: str) -> bool:
         allowed = {"saved", "skipped", "apply_requested", "applied"}
         if decision not in allowed:
             raise ValueError(f"unsupported decision: {decision}")
+        row = self.conn.execute("SELECT decision FROM vacancies WHERE id=?", (local_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"vacancy not found: {local_id}")
+        if row["decision"] == decision:
+            return False
         self.conn.execute(
             """
             UPDATE vacancies
@@ -140,6 +145,14 @@ class VacancyStore:
             (local_id, decision),
         )
         self.conn.commit()
+        return True
+
+    def decision_event_count(self, local_id: int) -> int:
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM decision_events WHERE vacancy_id=?", (local_id,)
+            ).fetchone()[0]
+        )
 
     def stats(self) -> dict[str, int]:
         total = int(self.conn.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0])

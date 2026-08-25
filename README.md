@@ -33,6 +33,8 @@ The current code can:
 - generate a short cover letter only from portfolio evidence actually matched to the vacancy;
 - ask why a vacancy was skipped: salary, office/geography, seniority, stack or other;
 - store structured decision events for a future feedback-aware ranker;
+- bind the owner chat automatically on the first `/start` and persist that binding;
+- reject mutations from other Telegram chats after binding;
 - keep application state fail-closed instead of claiming a response was sent when it was not.
 
 ## Telegram flow
@@ -54,6 +56,12 @@ Risks: no explicit blocker detected
 After the real response is sent, `✅ I applied` moves the local funnel to `applied`.
 
 `❌ Skip` asks for a structured reason. Those reasons are already visible through `/stats` and are intended to improve ranking later.
+
+## First-run Telegram binding
+
+`TELEGRAM_CHAT_ID` is optional. If it is empty, JobRadar starts in an unbound state and waits for the first `/start` message. That chat ID is stored in the persistent database and becomes the only authorized chat for mutations and vacancy pushes.
+
+For a fixed deployment, `TELEGRAM_CHAT_ID` may still be provided explicitly and takes precedence over the persisted value.
 
 ## Why application submission is a separate boundary
 
@@ -90,8 +98,8 @@ See [`.env.example`](.env.example).
 
 Important runtime values:
 
-- `TELEGRAM_BOT_TOKEN` — Telegram bot secret;
-- `TELEGRAM_CHAT_ID` — only this chat may mutate JobRadar state;
+- `TELEGRAM_BOT_TOKEN` — required Telegram bot secret;
+- `TELEGRAM_CHAT_ID` — optional fixed owner chat; otherwise first `/start` claims the bot;
 - `JOBRADAR_SCORE_THRESHOLD` — minimum score for push delivery;
 - `JOBRADAR_TARGET_SALARY_RUB` — salary preference signal;
 - `HH_SEARCH_QUERIES` — semicolon-separated search phrases;
@@ -109,7 +117,7 @@ Core invariants:
 1. vacancy identity is stable by `(source, external_id)`;
 2. Telegram delivery is marked only after a successful send;
 3. repeated identical decisions are idempotent;
-4. unknown Telegram chats cannot mutate state;
+4. owner chat binding is persistent and only one chat may mutate state;
 5. scoring remains explainable;
 6. `applied` never means merely "an attempt was made";
 7. external OAuth mutations fail closed.

@@ -1,0 +1,8 @@
+[project]
+name = "jobradar-vacancy-intelligence"
+version = "0.1.0"
+description = "Vacancy intelligence assistant with HH API, explainable scoring and Telegram actions"
+requires-python = ">=3.12"
+
+[tool.unittest]
+start-directory = "tests"

@@ -42,8 +42,15 @@ class StorageTests(unittest.TestCase):
 
     def test_decision_is_recorded(self):
         local_id = self.store.upsert(self.ranked())
-        self.store.decide(local_id, "saved")
+        changed = self.store.decide(local_id, "saved")
+        self.assertTrue(changed)
         self.assertEqual(self.store.stats()["saved"], 1)
+
+    def test_repeated_same_decision_is_idempotent(self):
+        local_id = self.store.upsert(self.ranked())
+        self.assertTrue(self.store.decide(local_id, "saved"))
+        self.assertFalse(self.store.decide(local_id, "saved"))
+        self.assertEqual(self.store.decision_event_count(local_id), 1)
 
 
 if __name__ == "__main__":

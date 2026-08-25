@@ -12,7 +12,6 @@ class TelegramClient:
         self.token = token
         self.chat_id = chat_id
         self.timeout = timeout
-        self.offset = 0
 
     @property
     def enabled(self) -> bool:
@@ -105,14 +104,11 @@ class TelegramClient:
     def answer_callback(self, callback_query_id: str, text: str) -> None:
         self._call("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
 
-    def get_updates(self, timeout: int = 1) -> list[dict]:
+    def get_updates(self, *, offset: int = 0, timeout: int = 1) -> list[dict]:
         if not self.enabled:
             return []
         result = self._call(
             "getUpdates",
-            {"offset": self.offset, "timeout": timeout, "allowed_updates": ["message", "callback_query"]},
+            {"offset": int(offset), "timeout": timeout, "allowed_updates": ["message", "callback_query"]},
         )
-        updates = result.get("result") or []
-        if updates:
-            self.offset = max(int(update["update_id"]) for update in updates) + 1
-        return updates
+        return list(result.get("result") or [])

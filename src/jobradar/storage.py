@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS vacancies (
     risks_json TEXT NOT NULL,
     sent_at TEXT,
     decision TEXT,
+    decision_reason TEXT,
     decision_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS decision_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     vacancy_id INTEGER NOT NULL REFERENCES vacancies(id),
     decision TEXT NOT NULL,
+    reason TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -48,7 +50,14 @@ class VacancyStore:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._ensure_column("vacancies", "decision_reason", "TEXT")
+        self._ensure_column("decision_events", "reason", "TEXT")
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, sql_type: str) -> None:
+        columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
     def close(self) -> None:
         self.conn.close()
@@ -123,26 +132,28 @@ class VacancyStore:
         )
         self.conn.commit()
 
-    def decide(self, local_id: int, decision: str) -> bool:
+    def decide(self, local_id: int, decision: str, reason: str | None = None) -> bool:
         allowed = {"saved", "skipped", "apply_requested", "applied"}
         if decision not in allowed:
             raise ValueError(f"unsupported decision: {decision}")
-        row = self.conn.execute("SELECT decision FROM vacancies WHERE id=?", (local_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT decision, decision_reason FROM vacancies WHERE id=?", (local_id,)
+        ).fetchone()
         if row is None:
             raise KeyError(f"vacancy not found: {local_id}")
-        if row["decision"] == decision:
+        if row["decision"] == decision and row["decision_reason"] == reason:
             return False
         self.conn.execute(
             """
             UPDATE vacancies
-            SET decision=?, decision_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+            SET decision=?, decision_reason=?, decision_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
             WHERE id=?
             """,
-            (decision, local_id),
+            (decision, reason, local_id),
         )
         self.conn.execute(
-            "INSERT INTO decision_events(vacancy_id, decision) VALUES (?, ?)",
-            (local_id, decision),
+            "INSERT INTO decision_events(vacancy_id, decision, reason) VALUES (?, ?, ?)",
+            (local_id, decision, reason),
         )
         self.conn.commit()
         return True
@@ -153,6 +164,18 @@ class VacancyStore:
                 "SELECT COUNT(*) FROM decision_events WHERE vacancy_id=?", (local_id,)
             ).fetchone()[0]
         )
+
+    def skip_reason_stats(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            """
+            SELECT COALESCE(decision_reason, 'other') AS reason, COUNT(*) AS total
+            FROM vacancies
+            WHERE decision='skipped'
+            GROUP BY COALESCE(decision_reason, 'other')
+            ORDER BY total DESC, reason ASC
+            """
+        ).fetchall()
+        return {str(row["reason"]): int(row["total"]) for row in rows}
 
     def stats(self) -> dict[str, int]:
         total = int(self.conn.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0])

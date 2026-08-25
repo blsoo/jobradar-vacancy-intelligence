@@ -81,8 +81,6 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
     text = (message.get("text") or "").strip().lower()
     incoming_chat_id = _chat_id_from_update(update)
 
-    # First-run bootstrap: when no chat is configured or persisted yet, the first
-    # /start claims the bot. The binding is stored in the persistent database.
     if not telegram.chat_id:
         if text == "/start" and incoming_chat_id:
             telegram.bind_chat(incoming_chat_id)
@@ -190,11 +188,7 @@ def poll_updates(
     *,
     timeout: int = 1,
 ) -> int:
-    """Process Telegram updates exactly once across short-lived worker runs.
-
-    The next Telegram update offset is persisted in SQLite so scheduled CI jobs do
-    not re-process old callbacks when a new Python process starts.
-    """
+    """Process Telegram updates exactly once across short-lived worker runs."""
     if not telegram.enabled:
         return 0
     raw_offset = store.get_setting("telegram_update_offset") or "0"
@@ -228,6 +222,15 @@ def _telegram_client(settings: Settings, store: VacancyStore) -> TelegramClient:
     return TelegramClient(settings.telegram_bot_token, chat_id)
 
 
+def _collection_due(store: VacancyStore, interval_seconds: int, now_epoch: int) -> bool:
+    raw = store.get_setting("last_collection_epoch") or "0"
+    try:
+        last = max(0, int(raw))
+    except ValueError:
+        last = 0
+    return last == 0 or now_epoch - last >= max(60, interval_seconds)
+
+
 def run_once(settings: Settings) -> int:
     store = VacancyStore(settings.db_path)
     telegram = _telegram_client(settings, store)
@@ -240,7 +243,6 @@ def run_once(settings: Settings) -> int:
 
 
 def run_tick(settings: Settings) -> int:
-    """One complete scheduled-worker iteration for GitHub/self-hosted CI."""
     store = VacancyStore(settings.db_path)
     telegram = _telegram_client(settings, store)
     try:
@@ -250,6 +252,34 @@ def run_tick(settings: Settings) -> int:
         print(
             f"JobRadar tick: collected={found} telegram_updates={processed} "
             f"pushed={sent} stats={store.stats()}"
+        )
+        return 0
+    finally:
+        store.close()
+
+
+def run_cron(settings: Settings) -> int:
+    """Short-lived worker intended to run once per minute from user cron.
+
+    Telegram updates are checked every invocation, while vacancy collection follows
+    JOBRADAR_POLL_SECONDS (300 seconds by default).
+    """
+    store = VacancyStore(settings.db_path)
+    telegram = _telegram_client(settings, store)
+    try:
+        now_epoch = int(time.time())
+        found = 0
+        collected = False
+        if _collection_due(store, settings.poll_seconds, now_epoch):
+            found = collect(settings, store)
+            store.set_setting("last_collection_epoch", str(now_epoch))
+            collected = True
+
+        processed = poll_updates(settings, store, telegram, timeout=0)
+        sent = push_new(settings, store, telegram)
+        print(
+            f"JobRadar cron: collection_due={int(collected)} collected={found} "
+            f"telegram_updates={processed} pushed={sent} stats={store.stats()}"
         )
         return 0
     finally:
@@ -272,7 +302,7 @@ def run_forever(settings: Settings) -> int:
                 try:
                     found, sent = cycle(settings, store, telegram)
                     print(f"cycle collected={found} pushed={sent}")
-                except Exception as exc:  # runtime boundary: keep the monitor alive
+                except Exception as exc:
                     print(f"collection error: {exc}", file=sys.stderr)
                 next_collect = now + max(settings.poll_seconds, 60)
 
@@ -297,9 +327,11 @@ def main() -> int:
         return run_once(settings)
     if mode == "tick":
         return run_tick(settings)
+    if mode == "cron":
+        return run_cron(settings)
     if mode == "run":
         return run_forever(settings)
-    print("Usage: python -m jobradar.app [once|tick|run]", file=sys.stderr)
+    print("Usage: python -m jobradar.app [once|tick|cron|run]", file=sys.stderr)
     return 2
 
 

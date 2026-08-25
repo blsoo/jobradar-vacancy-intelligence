@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import json
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .models import RankedVacancy
@@ -69,7 +68,7 @@ class TelegramClient:
                 ],
                 [
                     {"text": "❌ Пропустить", "callback_data": f"skip:{item.local_id}"},
-                    {"text": "🔗 Открыть HH", "url": v.url},
+                    {"text": "⚡ Форма отклика HH", "url": v.application_url},
                 ],
             ]
         }

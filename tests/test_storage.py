@@ -59,6 +59,13 @@ class StorageTests(unittest.TestCase):
         self.store.decide(second, "skipped", reason="salary")
         self.assertEqual(self.store.skip_reason_stats(), {"salary": 2})
 
+    def test_runtime_setting_is_persistent(self):
+        self.assertIsNone(self.store.get_setting("telegram_chat_id"))
+        self.store.set_setting("telegram_chat_id", "123456")
+        self.assertEqual(self.store.get_setting("telegram_chat_id"), "123456")
+        self.store.set_setting("telegram_chat_id", "654321")
+        self.assertEqual(self.store.get_setting("telegram_chat_id"), "654321")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,25 @@
+name: JobRadar checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile
+        run: python -m compileall -q src tests
+      - name: Unit tests
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
+      - name: Public safety check
+        run: |
+          ! grep -RIE --exclude-dir=.git --exclude='.env.example' '([A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|API_KEY)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]+)' .
+          ! grep -RIE --exclude-dir=.git --exclude='.env.example' '[A-Za-z0-9._%+-]+@gmail\.com' .

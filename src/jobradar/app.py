@@ -19,6 +19,8 @@ from .telegram import TelegramClient
 
 DIGEST_COOLDOWN_SECONDS = 30 * 60
 DIGEST_SIZE = 3
+FALLBACK_MIN_SCORE = 60
+FALLBACK_HOUR_LOCAL = 18
 
 SKIP_REASONS = {
     "salary": "зарплата",
@@ -69,6 +71,10 @@ def _digest_due(store: VacancyStore, now_epoch: int, *, force: bool = False) -> 
     return last == 0 or now_epoch - last >= DIGEST_COOLDOWN_SECONDS
 
 
+def _local_date(settings: Settings, now_epoch: int) -> str:
+    return datetime.fromtimestamp(now_epoch, ZoneInfo(settings.timezone)).date().isoformat()
+
+
 def push_new(
     settings: Settings,
     store: VacancyStore,
@@ -89,6 +95,41 @@ def push_new(
     for item in queue:
         store.mark_sent(int(item.local_id))
     store.set_setting("last_digest_epoch", str(now_epoch))
+    store.set_setting("last_primary_digest_date", _local_date(settings, now_epoch))
+    return len(queue)
+
+
+def _fallback_due(settings: Settings, store: VacancyStore, now_epoch: int) -> bool:
+    local_now = datetime.fromtimestamp(now_epoch, ZoneInfo(settings.timezone))
+    today = local_now.date().isoformat()
+    if local_now.hour < FALLBACK_HOUR_LOCAL:
+        return False
+    if store.get_setting("last_primary_digest_date") == today:
+        return False
+    return store.get_setting("last_fallback_digest_date") != today
+
+
+def push_daily_fallback(
+    settings: Settings,
+    store: VacancyStore,
+    telegram: TelegramClient,
+    *,
+    now_epoch: int | None = None,
+) -> int:
+    if not telegram.can_send:
+        return 0
+    now_epoch = int(time.time()) if now_epoch is None else int(now_epoch)
+    if not _fallback_due(settings, store, now_epoch):
+        return 0
+    limit = max(1, min(DIGEST_SIZE, settings.max_push_per_cycle))
+    candidates = store.unsent(FALLBACK_MIN_SCORE, max(12, limit * 4))
+    queue = [item for item in candidates if item.score.total < settings.score_threshold][:limit]
+    if not queue:
+        return 0
+    telegram.send_digest(queue, target_salary_rub=settings.target_salary_rub)
+    for item in queue:
+        store.mark_sent(int(item.local_id))
+    store.set_setting("last_fallback_digest_date", _local_date(settings, now_epoch))
     return len(queue)
 
 
@@ -197,6 +238,7 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
             telegram.send_text(
                 "✅ JobRadar привязан.\n"
                 "Тихий режим: максимум один дайджест за 30 минут и до 3 лучших вакансий.\n"
+                "Если топовых вакансий за день нет, вечером придёт один fallback 60–69/100.\n"
                 "После HH OAuth бот также следит за ответами работодателей и собеседованиями.\n"
                 "/stats — воронка · /hh_status — связь с HH."
             )
@@ -216,6 +258,7 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         status = "подключён" if oauth.connected() else ("готов к /hh_auth" if oauth.can_authorize else "ещё не настроен")
         telegram.send_text(
             "✅ JobRadar работает в тихом режиме.\n"
+            "70+/100 — основной дайджест; 60–69/100 — максимум один вечерний fallback, если день пустой.\n"
             f"HH Inbox: {status}.\n"
             "/stats — вакансии, отклики, приглашения и собесы."
         )
@@ -466,6 +509,7 @@ def run_cron(settings: Settings) -> int:
         inbox = 0
         reminders = 0
         sent = 0
+        fallback_sent = 0
         was_bound = telegram.can_send
 
         try:
@@ -503,10 +547,16 @@ def run_cron(settings: Settings) -> int:
             except Exception as exc:
                 print(f"telegram push error: {type(exc).__name__}", file=sys.stderr)
 
+        if collected and sent == 0:
+            try:
+                fallback_sent = push_daily_fallback(settings, store, telegram, now_epoch=now_epoch)
+            except Exception as exc:
+                print(f"telegram fallback error: {type(exc).__name__}", file=sys.stderr)
+
         print(
             f"JobRadar cron: collection_success={int(collected)} collected={found} "
             f"telegram_updates={processed} inbox={inbox} reminders={reminders} "
-            f"pushed={sent} stats={store.stats()}"
+            f"pushed={sent} fallback={fallback_sent} stats={store.stats()}"
         )
         return 0
     finally:

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime
 import sys
 import time
+from zoneinfo import ZoneInfo
 
 from .config import Settings
 from .cover_letter import build_cover_letter
 from .hh_client import HHClient
+from .hh_inbox import HHInboxClient, classify_employer_message
+from .interviews import detect_interview_datetime, reminder_times
 from .models import RankedVacancy
 from .scoring import score_vacancy
 from .storage import VacancyStore
@@ -70,7 +74,7 @@ def push_new(
     if not queue:
         return 0
 
-    telegram.send_digest(queue)
+    telegram.send_digest(queue, target_salary_rub=settings.target_salary_rub)
     for item in queue:
         store.mark_sent(int(item.local_id))
     store.set_setting("last_digest_epoch", str(now_epoch))
@@ -90,13 +94,19 @@ def _authorized_chat(telegram: TelegramClient, update: dict) -> bool:
 
 def _stats_text(store: VacancyStore) -> str:
     stats = store.stats()
+    pipeline = store.application_stats()
     return (
         "📊 JobRadar\n"
         f"Вакансий в базе: {stats['total']}\n"
         f"Показано: {stats['sent']}\n"
         f"Сохранено: {stats['saved']}\n"
         f"К отклику: {stats['apply_requested']}\n"
-        f"Пропущено: {stats['skipped']}"
+        f"Пропущено: {stats['skipped']}\n\n"
+        "💼 Воронка\n"
+        f"В работе: {pipeline.get('in_progress', 0)}\n"
+        f"Приглашений: {pipeline.get('invited', 0)}\n"
+        f"Отказов: {pipeline.get('rejected', 0)}\n"
+        f"Запланировано собесов: {pipeline.get('interviews', 0)}"
     )
 
 
@@ -111,9 +121,9 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
             store.set_setting("telegram_chat_id", incoming_chat_id)
             telegram.send_text(
                 "✅ JobRadar привязан.\n"
-                "Тихий режим: максимум один дайджест за 30 минут и до 3 лучших вакансий в нём.\n"
-                "На каждую вакансию: 🔥 Отклик / 📌 Сохранить / ❌ Мимо.\n"
-                "/stats — статистика."
+                "Тихий режим: максимум один дайджест за 30 минут и до 3 лучших вакансий.\n"
+                "После HH OAuth бот также следит за ответами работодателей и собеседованиями.\n"
+                "/stats — воронка."
             )
         return
 
@@ -124,8 +134,11 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         return
 
     if text == "/start":
+        oauth = "подключён" if settings.hh_oauth_token else "ещё не подключён"
         telegram.send_text(
-            "✅ JobRadar работает в тихом режиме: до 3 лучших вакансий одним сообщением, не чаще раза в 30 минут. /stats — статистика."
+            "✅ JobRadar работает в тихом режиме.\n"
+            f"HH Inbox: {oauth}.\n"
+            "/stats — вакансии, отклики, приглашения и собесы."
         )
         return
 
@@ -161,7 +174,6 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         telegram.answer_callback(callback_id, "❌ Пропущено")
         return
 
-    # Compatibility with older skip-reason buttons already sent before quiet mode.
     if action == "skipr" and extra in SKIP_REASONS:
         store.decide(local_id, "skipped", reason=extra)
         telegram.answer_callback(callback_id, f"❌ Учёл: {SKIP_REASONS[extra]}")
@@ -174,7 +186,7 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         telegram.send_text(
             "🔥 Подготовленный отклик\n\n"
             f"{letter}\n\n"
-            "Сейчас реальная отправка на HH требует действия на стороне HH. Открой форму, отправь и отметь результат второй кнопкой.",
+            "Открой форму HH, отправь и нажми «Я откликнулся». После HH OAuth JobRadar будет сам отслеживать ответ работодателя.",
             reply_markup={
                 "inline_keyboard": [
                     [{"text": "⚡ Открыть форму HH", "url": item.vacancy.application_url}],
@@ -186,7 +198,7 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
 
     if action == "applied":
         store.decide(local_id, "applied")
-        telegram.answer_callback(callback_id, "✅ Отклик отмечен")
+        telegram.answer_callback(callback_id, "✅ Отклик записан и добавлен в воронку")
         return
 
     if callback_id:
@@ -200,7 +212,6 @@ def poll_updates(
     *,
     timeout: int = 1,
 ) -> int:
-    """Process Telegram updates exactly once across short-lived worker runs."""
     if not telegram.enabled:
         return 0
     raw_offset = store.get_setting("telegram_update_offset") or "0"
@@ -219,6 +230,85 @@ def poll_updates(
     return processed
 
 
+def poll_hh_inbox(settings: Settings, store: VacancyStore, telegram: TelegramClient) -> int:
+    """Notify once for new employer chat messages and schedule detected interviews."""
+    if not settings.hh_oauth_token or not telegram.can_send:
+        return 0
+    client = HHInboxClient(settings.hh_oauth_token, settings.hh_user_agent)
+    raw_seen = store.settings_by_prefix("hh_chat_last_")
+    last_seen = {key.removeprefix("hh_chat_last_"): value for key, value in raw_seen.items()}
+    messages = client.new_employer_messages(last_seen)
+    processed = 0
+
+    for msg in messages:
+        if not msg.vacancy_id:
+            # Still advance the cursor; an unbound chat must not notify forever.
+            store.set_setting(f"hh_chat_last_{msg.chat_id}", msg.message_id)
+            continue
+        event_type = classify_employer_message(msg.text)
+        created, application_id = store.record_employer_event(
+            external_vacancy_id=msg.vacancy_id,
+            source_event_id=f"hh-chat:{msg.chat_id}:{msg.message_id}",
+            event_type=event_type,
+            text=msg.text,
+            event_at=msg.created_at,
+            chat_id=msg.chat_id,
+            sender_name=msg.sender_name,
+        )
+        item = store.get_by_external_id("hh", msg.vacancy_id)
+        interview_at = None
+
+        if created and event_type == "positive":
+            detection = detect_interview_datetime(msg.text, msg.created_at, settings.timezone)
+            if detection is not None:
+                interview_at = detection.scheduled_at
+                store.schedule_interview(
+                    application_id=application_id,
+                    scheduled_at=detection.scheduled_at,
+                    timezone=settings.timezone,
+                    confidence=detection.confidence,
+                    evidence=detection.evidence,
+                    source_event_id=f"hh-chat:{msg.chat_id}:{msg.message_id}",
+                    reminders=reminder_times(detection.scheduled_at),
+                )
+            telegram.send_positive_response(
+                item,
+                sender_name=msg.sender_name,
+                message_text=msg.text,
+                interview_at=interview_at,
+                target_salary_rub=settings.target_salary_rub,
+            )
+        elif created and event_type == "rejection":
+            telegram.send_rejection(item, msg.sender_name, msg.text)
+        elif created:
+            telegram.send_employer_message(item, msg.sender_name, msg.text)
+
+        if created:
+            store.mark_employer_event_notified(f"hh-chat:{msg.chat_id}:{msg.message_id}")
+            processed += 1
+        store.set_setting(f"hh_chat_last_{msg.chat_id}", msg.message_id)
+
+    return processed
+
+
+def send_due_reminders(settings: Settings, store: VacancyStore, telegram: TelegramClient) -> int:
+    if not telegram.can_send:
+        return 0
+    now = datetime.now(ZoneInfo(settings.timezone))
+    sent = 0
+    for row in store.due_reminders(now):
+        scheduled = datetime.fromisoformat(str(row["scheduled_at"]))
+        telegram.send_interview_reminder(
+            title=str(row["title"] or "Вакансия"),
+            company=str(row["company"] or "Компания"),
+            scheduled_at=scheduled,
+            kind=str(row["kind"]),
+        )
+        store.mark_reminder_sent(int(row["reminder_id"]))
+        sent += 1
+    return sent
+
+
 def cycle(settings: Settings, store: VacancyStore, telegram: TelegramClient) -> tuple[int, int]:
     found = collect(settings, store)
     sent = push_new(settings, store, telegram)
@@ -234,8 +324,8 @@ def _telegram_client(settings: Settings, store: VacancyStore) -> TelegramClient:
     return TelegramClient(settings.telegram_bot_token, chat_id)
 
 
-def _collection_due(store: VacancyStore, interval_seconds: int, now_epoch: int) -> bool:
-    raw = store.get_setting("last_collection_epoch") or "0"
+def _due(store: VacancyStore, key: str, interval_seconds: int, now_epoch: int) -> bool:
+    raw = store.get_setting(key) or "0"
     try:
         last = max(0, int(raw))
     except ValueError:
@@ -248,7 +338,9 @@ def run_once(settings: Settings) -> int:
     telegram = _telegram_client(settings, store)
     try:
         found, sent = cycle(settings, store, telegram)
-        print(f"JobRadar: collected={found} pushed={sent} stats={store.stats()}")
+        inbox = poll_hh_inbox(settings, store, telegram)
+        reminders = send_due_reminders(settings, store, telegram)
+        print(f"JobRadar: collected={found} pushed={sent} inbox={inbox} reminders={reminders} stats={store.stats()}")
         return 0
     finally:
         store.close()
@@ -260,10 +352,12 @@ def run_tick(settings: Settings) -> int:
     try:
         found = collect(settings, store)
         processed = poll_updates(settings, store, telegram, timeout=0)
+        inbox = poll_hh_inbox(settings, store, telegram)
+        reminders = send_due_reminders(settings, store, telegram)
         sent = push_new(settings, store, telegram)
         print(
-            f"JobRadar tick: collected={found} telegram_updates={processed} "
-            f"pushed={sent} stats={store.stats()}"
+            f"JobRadar tick: collected={found} telegram_updates={processed} inbox={inbox} "
+            f"reminders={reminders} pushed={sent} stats={store.stats()}"
         )
         return 0
     finally:
@@ -279,6 +373,8 @@ def run_cron(settings: Settings) -> int:
         found = 0
         collected = False
         processed = 0
+        inbox = 0
+        reminders = 0
         sent = 0
         was_bound = telegram.can_send
 
@@ -289,7 +385,7 @@ def run_cron(settings: Settings) -> int:
 
         just_bound = (not was_bound) and telegram.can_send
 
-        if _collection_due(store, settings.poll_seconds, now_epoch):
+        if _due(store, "last_collection_epoch", settings.poll_seconds, now_epoch):
             store.set_setting("last_collection_epoch", str(now_epoch))
             try:
                 found = collect(settings, store)
@@ -298,8 +394,18 @@ def run_cron(settings: Settings) -> int:
             except Exception as exc:
                 print(f"collection error: {exc}", file=sys.stderr)
 
-        # Search can run frequently, but notifications stay quiet. A digest is
-        # at most three vacancies and no more than once per 30 minutes.
+        if settings.hh_oauth_token and _due(store, "last_inbox_poll_epoch", settings.inbox_poll_seconds, now_epoch):
+            store.set_setting("last_inbox_poll_epoch", str(now_epoch))
+            try:
+                inbox = poll_hh_inbox(settings, store, telegram)
+            except Exception as exc:
+                print(f"HH inbox error: {exc}", file=sys.stderr)
+
+        try:
+            reminders = send_due_reminders(settings, store, telegram)
+        except Exception as exc:
+            print(f"reminder error: {exc}", file=sys.stderr)
+
         if just_bound or collected:
             try:
                 sent = push_new(settings, store, telegram, force=just_bound)
@@ -308,7 +414,8 @@ def run_cron(settings: Settings) -> int:
 
         print(
             f"JobRadar cron: collection_success={int(collected)} collected={found} "
-            f"telegram_updates={processed} pushed={sent} stats={store.stats()}"
+            f"telegram_updates={processed} inbox={inbox} reminders={reminders} "
+            f"pushed={sent} stats={store.stats()}"
         )
         return 0
     finally:
@@ -318,30 +425,33 @@ def run_cron(settings: Settings) -> int:
 def run_forever(settings: Settings) -> int:
     store = VacancyStore(settings.db_path)
     telegram = _telegram_client(settings, store)
-    if not telegram.enabled:
-        print("Warning: Telegram is disabled; configure TELEGRAM_BOT_TOKEN")
-    elif not telegram.chat_id:
-        print("Telegram token configured; waiting for the first /start to bind the owner chat")
-
     next_collect = 0.0
+    next_inbox = 0.0
     try:
         while True:
             now = time.monotonic()
             if now >= next_collect:
                 try:
-                    found, sent = cycle(settings, store, telegram)
-                    print(f"cycle collected={found} pushed={sent}")
+                    cycle(settings, store, telegram)
                 except Exception as exc:
                     print(f"collection error: {exc}", file=sys.stderr)
                 next_collect = now + max(settings.poll_seconds, 60)
 
-            if telegram.enabled:
+            if settings.hh_oauth_token and now >= next_inbox:
                 try:
-                    poll_updates(settings, store, telegram, timeout=1)
+                    poll_hh_inbox(settings, store, telegram)
                 except Exception as exc:
-                    print(f"telegram error: {exc}", file=sys.stderr)
+                    print(f"HH inbox error: {exc}", file=sys.stderr)
+                next_inbox = now + max(settings.inbox_poll_seconds, 60)
+
+            try:
+                send_due_reminders(settings, store, telegram)
+                if telegram.enabled:
+                    poll_updates(settings, store, telegram, timeout=1)
+                else:
                     time.sleep(2)
-            else:
+            except Exception as exc:
+                print(f"runtime error: {exc}", file=sys.stderr)
                 time.sleep(2)
     except KeyboardInterrupt:
         return 0

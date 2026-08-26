@@ -45,6 +45,16 @@ class Settings:
     hh_client_id: str = ""
     hh_client_secret: str = ""
     hh_redirect_uri: str = "https://github.com/blsoo/jobradar-vacancy-intelligence"
+    email_imap_host: str = ""
+    email_imap_port: int = 993
+    email_imap_username: str = ""
+    email_imap_password: str = ""
+    email_imap_mailbox: str = "INBOX"
+    email_poll_seconds: int = 60
+
+    @property
+    def email_monitor_enabled(self) -> bool:
+        return bool(self.email_imap_host and self.email_imap_username and self.email_imap_password)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -83,4 +93,10 @@ class Settings:
                 "HH_REDIRECT_URI",
                 "https://github.com/blsoo/jobradar-vacancy-intelligence",
             ).strip(),
+            email_imap_host=os.getenv("EMAIL_IMAP_HOST", "").strip(),
+            email_imap_port=int(os.getenv("EMAIL_IMAP_PORT", "993")),
+            email_imap_username=os.getenv("EMAIL_IMAP_USERNAME", "").strip(),
+            email_imap_password=os.getenv("EMAIL_IMAP_PASSWORD", "").strip(),
+            email_imap_mailbox=os.getenv("EMAIL_IMAP_MAILBOX", "INBOX").strip() or "INBOX",
+            email_poll_seconds=max(60, int(os.getenv("JOBRADAR_EMAIL_POLL_SECONDS", "60"))),
         )

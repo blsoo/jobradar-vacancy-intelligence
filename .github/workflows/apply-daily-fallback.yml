@@ -1,0 +1,250 @@
+name: Apply daily fallback digest
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-daily-fallback.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply fallback patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          app = Path('src/jobradar/app.py')
+          text = app.read_text(encoding='utf-8')
+
+          old = "DIGEST_COOLDOWN_SECONDS = 30 * 60\nDIGEST_SIZE = 3\n"
+          new = (
+              "DIGEST_COOLDOWN_SECONDS = 30 * 60\n"
+              "DIGEST_SIZE = 3\n"
+              "FALLBACK_MIN_SCORE = 60\n"
+              "FALLBACK_HOUR_LOCAL = 18\n"
+          )
+          if old not in text:
+              raise SystemExit('constants anchor missing')
+          text = text.replace(old, new, 1)
+
+          old = '    store.set_setting("last_digest_epoch", str(now_epoch))\n    return len(queue)\n'
+          new = (
+              '    store.set_setting("last_digest_epoch", str(now_epoch))\n'
+              '    store.set_setting("last_primary_digest_date", _local_date(settings, now_epoch))\n'
+              '    return len(queue)\n'
+          )
+          if old not in text:
+              raise SystemExit('push_new anchor missing')
+          text = text.replace(old, new, 1)
+
+          anchor = '\n\ndef _chat_id_from_update(update: dict) -> str:\n'
+          insert = '''
+
+
+def _local_date(settings: Settings, now_epoch: int) -> str:
+    return datetime.fromtimestamp(now_epoch, ZoneInfo(settings.timezone)).date().isoformat()
+
+
+def _fallback_due(settings: Settings, store: VacancyStore, now_epoch: int) -> bool:
+    local_now = datetime.fromtimestamp(now_epoch, ZoneInfo(settings.timezone))
+    today = local_now.date().isoformat()
+    if local_now.hour < FALLBACK_HOUR_LOCAL:
+        return False
+    if store.get_setting("last_primary_digest_date") == today:
+        return False
+    return store.get_setting("last_fallback_digest_date") != today
+
+
+def push_daily_fallback(
+    settings: Settings,
+    store: VacancyStore,
+    telegram: TelegramClient,
+    *,
+    now_epoch: int | None = None,
+) -> int:
+    if not telegram.can_send:
+        return 0
+    now_epoch = int(time.time()) if now_epoch is None else int(now_epoch)
+    if not _fallback_due(settings, store, now_epoch):
+        return 0
+    limit = max(1, min(DIGEST_SIZE, settings.max_push_per_cycle))
+    candidates = store.unsent(FALLBACK_MIN_SCORE, max(12, limit * 4))
+    queue = [item for item in candidates if item.score.total < settings.score_threshold][:limit]
+    if not queue:
+        return 0
+    telegram.send_digest(queue, target_salary_rub=settings.target_salary_rub)
+    for item in queue:
+        store.mark_sent(int(item.local_id))
+    store.set_setting("last_fallback_digest_date", _local_date(settings, now_epoch))
+    return len(queue)
+'''
+          if anchor not in text:
+              raise SystemExit('function insertion anchor missing')
+          text = text.replace(anchor, insert + anchor, 1)
+
+          old = '        sent = 0\n        was_bound = telegram.can_send\n'
+          new = '        sent = 0\n        fallback_sent = 0\n        was_bound = telegram.can_send\n'
+          if old not in text:
+              raise SystemExit('run_cron counter anchor missing')
+          text = text.replace(old, new, 1)
+
+          old = '''        if just_bound or collected:
+            try:
+                sent = push_new(settings, store, telegram, force=just_bound)
+            except Exception as exc:
+                print(f"telegram push error: {type(exc).__name__}", file=sys.stderr)
+
+        print(
+'''
+          new = '''        if just_bound or collected:
+            try:
+                sent = push_new(settings, store, telegram, force=just_bound)
+            except Exception as exc:
+                print(f"telegram push error: {type(exc).__name__}", file=sys.stderr)
+
+        if collected and sent == 0:
+            try:
+                fallback_sent = push_daily_fallback(settings, store, telegram, now_epoch=now_epoch)
+            except Exception as exc:
+                print(f"telegram fallback error: {type(exc).__name__}", file=sys.stderr)
+
+        print(
+'''
+          if old not in text:
+              raise SystemExit('run_cron delivery anchor missing')
+          text = text.replace(old, new, 1)
+
+          old = '            f"pushed={sent} stats={store.stats()}"\n'
+          new = '            f"pushed={sent} fallback={fallback_sent} stats={store.stats()}"\n'
+          if old not in text:
+              raise SystemExit('run_cron log anchor missing')
+          text = text.replace(old, new, 1)
+
+          app.write_text(text, encoding='utf-8')
+
+          readme = Path('README.md')
+          r = readme.read_text(encoding='utf-8')
+          r = r.replace(
+              '- send one quiet digest with at most three high-score vacancies, no more than once per 30 minutes;\n',
+              '- send one quiet digest with at most three high-score vacancies, no more than once per 30 minutes;\n'
+              '- if no top-score digest was sent that day, send one evening fallback with up to three best unsent vacancies scoring 60–69;\n',
+              1,
+          )
+          r = r.replace(
+              '- unsolicited vacancy digests have a 30-minute cooldown;\n',
+              '- unsolicited high-score vacancy digests have a 30-minute cooldown;\n'
+              '- the 60–69 fallback is capped at one evening digest per local day and is skipped if a top-score digest was already sent that day;\n',
+              1,
+          )
+          readme.write_text(r, encoding='utf-8')
+
+          test = Path('tests/test_daily_fallback.py')
+          test.write_text('''import os
+import tempfile
+import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from jobradar.app import push_daily_fallback
+from jobradar.config import Settings
+from jobradar.models import RankedVacancy, ScoreResult, Vacancy
+from jobradar.storage import VacancyStore
+
+
+class FakeTelegram:
+    chat_id = "42"
+
+    def __init__(self):
+        self.digests = []
+
+    @property
+    def can_send(self):
+        return True
+
+    def send_digest(self, items, *, target_salary_rub=70000):
+        self.digests.append([item.score.total for item in items])
+
+
+class DailyFallbackTests(unittest.TestCase):
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(prefix="jobradar-fallback-", suffix=".db")
+        os.close(fd)
+        self.store = VacancyStore(self.path)
+        self.settings = Settings(
+            telegram_bot_token="test",
+            telegram_chat_id="42",
+            db_path=self.path,
+            poll_seconds=300,
+            score_threshold=70,
+            max_push_per_cycle=3,
+            target_salary_rub=70000,
+            remote_preferred=True,
+            hh_search_queries=("junior system analyst",),
+            hh_area="113",
+            hh_per_page=10,
+            hh_user_agent="JobRadarTests/1.0",
+            hh_oauth_token="",
+            hh_resume_id="",
+            timezone="Europe/Moscow",
+        )
+        self.telegram = FakeTelegram()
+
+    def tearDown(self):
+        self.store.close()
+        os.unlink(self.path)
+
+    def add(self, external_id, score):
+        vacancy = Vacancy(
+            source="hh",
+            external_id=str(external_id),
+            title="Junior System Analyst",
+            company="Example",
+            url=f"https://hh.ru/vacancy/{external_id}",
+            published_at="2026-08-26T10:00:00+03:00",
+        )
+        self.store.upsert(RankedVacancy(vacancy=vacancy, score=ScoreResult(total=score, matched=("SQL",))))
+
+    @staticmethod
+    def epoch(hour):
+        dt = datetime(2026, 8, 26, hour, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        return int(dt.timestamp())
+
+    def test_fallback_waits_until_evening_and_only_uses_60_to_69(self):
+        self.add(1, 68)
+        self.add(2, 64)
+        self.add(3, 59)
+        self.add(4, 75)
+        self.assertEqual(push_daily_fallback(self.settings, self.store, self.telegram, now_epoch=self.epoch(17)), 0)
+        self.assertEqual(push_daily_fallback(self.settings, self.store, self.telegram, now_epoch=self.epoch(18)), 2)
+        self.assertEqual(self.telegram.digests, [[68, 64]])
+
+    def test_fallback_runs_only_once_per_day(self):
+        self.add(1, 68)
+        self.add(2, 66)
+        self.assertEqual(push_daily_fallback(self.settings, self.store, self.telegram, now_epoch=self.epoch(18)), 2)
+        self.add(3, 65)
+        self.assertEqual(push_daily_fallback(self.settings, self.store, self.telegram, now_epoch=self.epoch(20)), 0)
+
+    def test_primary_digest_today_blocks_fallback(self):
+        self.add(1, 68)
+        self.store.set_setting("last_primary_digest_date", "2026-08-26")
+        self.assertEqual(push_daily_fallback(self.settings, self.store, self.telegram, now_epoch=self.epoch(20)), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''', encoding='utf-8')
+          PY
+
+          git config user.name "blsoo"
+          git config user.email "317558701+blsoo@users.noreply.github.com"
+          git add src/jobradar/app.py README.md tests/test_daily_fallback.py
+          git commit -m "Add quiet daily fallback vacancy digest"
+          git push

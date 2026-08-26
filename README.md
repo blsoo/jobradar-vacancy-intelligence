@@ -26,6 +26,7 @@ The current code can:
 - rank them for a Junior System Analyst / Integration profile;
 - deduplicate vacancies and keep state in SQLite;
 - send one quiet digest with at most three high-score vacancies, no more than once per 30 minutes;
+- if no top-score digest was sent that day, send one evening fallback with up to three best unsent vacancies scoring 60–69;
 - expose exactly three first-level actions per vacancy: `Apply`, `Save`, `Skip`;
 - show salary, screening-fit band, personal interest-fit score and a short explanation of what the job actually involves;
 - build cover letters only from evidence already present in the portfolio profile;
@@ -111,10 +112,11 @@ Repeated polling or worker restarts therefore do not create duplicate invitation
 Search and Telegram control are intentionally separated:
 
 - vacancy discovery may run every few minutes;
-- low-score vacancies stay silent;
+- vacancies below 60 stay silent;
 - old backlog is not drained into Telegram;
 - at most three opportunities are shown in one digest;
-- unsolicited vacancy digests have a 30-minute cooldown;
+- unsolicited high-score vacancy digests have a 30-minute cooldown;
+- the 60–69 fallback is capped at one evening digest per local day and is skipped if a top-score digest was already sent that day;
 - employer responses and interview reminders are event notifications and bypass the vacancy-digest cooldown;
 - button callbacks and `/stats` can still be processed every minute.
 
@@ -161,10 +163,10 @@ Important values:
 
 - `TELEGRAM_BOT_TOKEN` — Telegram secret, never committed;
 - `TELEGRAM_CHAT_ID` — optional fixed owner chat;
-- `JOBRADAR_SCORE_THRESHOLD` — minimum vacancy score for Telegram delivery, default `70`;
+- `JOBRADAR_SCORE_THRESHOLD` — minimum vacancy score for regular Telegram delivery, default `70`;
 - `JOBRADAR_MAX_PUSH_PER_CYCLE` — hard cap per digest, default `3`;
 - `JOBRADAR_TARGET_SALARY_RUB` — salary preference signal;
-- `JOBRADAR_TIMEZONE` — timezone used for interview parsing and reminders;
+- `JOBRADAR_TIMEZONE` — timezone used for interview parsing, reminders and the daily fallback window;
 - `JOBRADAR_INBOX_POLL_SECONDS` — employer inbox check cadence;
 - `HH_CLIENT_ID` / `HH_CLIENT_SECRET` — HH API application credentials kept only in runtime secrets;
 - `HH_REDIRECT_URI` — redirect URI registered for the HH API application;

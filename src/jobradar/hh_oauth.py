@@ -63,9 +63,9 @@ class HHOAuthManager:
         expires_in = int(payload.get("expires_in") or 0)
         if not access:
             raise RuntimeError("HH token response did not contain access_token")
-        # Keep a small safety margin so we do not start a request with a token
-        # that expires mid-cycle.
-        expires_at = int(time.time()) + max(0, expires_in - 30)
+        # HH explicitly allows the one-time refresh token only after the current
+        # access token has expired, so store the real expiry without early refresh.
+        expires_at = int(time.time()) + max(0, expires_in)
         self.store.set_setting("hh_access_token", access)
         if refresh:
             self.store.set_setting("hh_refresh_token", refresh)
@@ -106,8 +106,7 @@ class HHOAuthManager:
     def exchange_redirect(self, redirect_value: str) -> HHToken:
         if not self.can_authorize:
             raise RuntimeError("HH OAuth client credentials are not configured")
-        raw = redirect_value.strip()
-        parsed = urlparse(raw)
+        parsed = urlparse(redirect_value.strip())
         query = parse_qs(parsed.query)
         code = (query.get("code") or [""])[0].strip()
         state = (query.get("state") or [""])[0].strip()
@@ -145,7 +144,6 @@ class HHOAuthManager:
     def access_token(self) -> str:
         stored = self._stored()
         if stored is not None:
-            # HH documents that refresh is allowed only after access-token expiry.
             if stored.expires_at <= 0 or int(time.time()) < stored.expires_at:
                 return stored.access_token
             if stored.refresh_token:

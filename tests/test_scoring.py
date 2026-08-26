@@ -25,6 +25,19 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("SQL", result.matched)
         self.assertIn("remote", result.matched)
 
+    def test_explicit_junior_system_analyst_title_passes_without_api_enrichment(self):
+        vacancy = Vacancy(
+            source="hh",
+            external_id="rss-1",
+            title="Системный аналитик (Junior) / L2",
+            company="Example",
+            url="https://hh.ru/vacancy/136200894",
+            published_at="2026-08-25T10:00:00+0300",
+        )
+        result = score_vacancy(vacancy)
+        self.assertGreaterEqual(result.total, 55)
+        self.assertIn("core junior analyst match", result.matched)
+
     def test_senior_role_is_penalized(self):
         vacancy = Vacancy(
             source="hh",

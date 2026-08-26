@@ -302,6 +302,25 @@ def poll_updates(settings: Settings, store: VacancyStore, telegram: TelegramClie
     return processed
 
 
+def _refresh_full_vacancy(
+    settings: Settings,
+    store: VacancyStore,
+    vacancy_id: str,
+    access_token: str,
+) -> RankedVacancy | None:
+    try:
+        vacancy = HHClient(settings.hh_user_agent, access_token).get_vacancy(vacancy_id)
+        score = score_vacancy(
+            vacancy,
+            target_salary_rub=settings.target_salary_rub,
+            remote_preferred=settings.remote_preferred,
+        )
+        local_id = store.upsert(RankedVacancy(vacancy=vacancy, score=score))
+        return store.get(local_id)
+    except Exception:
+        return store.get_by_external_id("hh", vacancy_id)
+
+
 def poll_hh_inbox(settings: Settings, store: VacancyStore, telegram: TelegramClient) -> int:
     """Notify once for new employer chat messages and schedule detected interviews."""
     access_token = _oauth_manager(settings, store).access_token()
@@ -331,6 +350,7 @@ def poll_hh_inbox(settings: Settings, store: VacancyStore, telegram: TelegramCli
         interview_at = None
 
         if created and event_type == "positive":
+            item = _refresh_full_vacancy(settings, store, msg.vacancy_id, access_token)
             detection = detect_interview_datetime(msg.text, msg.created_at, settings.timezone)
             if detection is not None:
                 interview_at = detection.scheduled_at

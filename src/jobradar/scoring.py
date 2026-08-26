@@ -8,6 +8,7 @@ POSITIVE_RULES: tuple[tuple[str, int, str], ...] = (
     ("system analyst", 18, "system analysis"),
     ("стаж", 14, "internship"),
     ("junior", 14, "junior"),
+    ("младш", 14, "junior"),
     ("sql", 10, "SQL"),
     ("rest", 9, "REST"),
     ("http", 6, "HTTP"),
@@ -51,6 +52,7 @@ def score_vacancy(
     remote_preferred: bool = True,
 ) -> ScoreResult:
     text = vacancy.searchable_text
+    title = vacancy.title.lower()
     score = 10
     matched: list[str] = []
     risks: list[str] = []
@@ -63,6 +65,17 @@ def score_vacancy(
             matched.append(label)
             reasons.append(f"+{weight} {label}")
             seen_labels.add(label)
+
+    system_title = (
+        ("систем" in title and "аналит" in title)
+        or "system analyst" in title
+        or "systems analyst" in title
+    )
+    junior_title = any(marker in title for marker in ("junior", "стаж", "младш", "intern"))
+    if system_title and junior_title:
+        score += 18
+        matched.append("core junior analyst match")
+        reasons.append("+18 explicit junior system analyst title")
 
     for needle, weight, label in NEGATIVE_RULES:
         if needle in text:

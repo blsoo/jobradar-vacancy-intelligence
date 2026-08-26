@@ -6,6 +6,7 @@ import json
 from urllib.request import Request, urlopen
 
 from .career_fit import evaluate_career_fit
+from .interview_prep import build_interview_prep
 from .models import RankedVacancy
 
 
@@ -131,6 +132,7 @@ class TelegramClient:
             self.send_text(text)
             return
         fit = evaluate_career_fit(item, target_salary_rub=target_salary_rub)
+        prep = build_interview_prep(item)
         work = " · ".join(fit.work_with[:5]) or "задачи стоит уточнить"
         advantages = " · ".join(fit.advantages[:5]) or "есть совпадение с целевым профилем"
         lines = [
@@ -145,6 +147,14 @@ class TelegramClient:
         if interview_at is not None:
             lines.append(f"📅 Собеседование: {interview_at.strftime('%d.%m.%Y %H:%M %Z')}")
             lines.append("⏰ Напоминания: за 24 часа, 2 часа и 30 минут")
+        if prep.priorities:
+            lines.extend(["", "📚 ЧТО ПОДГОТОВИТЬ К СОБЕСУ"])
+            for index, priority in enumerate(prep.priorities, start=1):
+                lines.append(f"{index}. {priority}")
+        if prep.likely_questions:
+            lines.extend(["", "❓ ЧТО МОГУТ СПРОСИТЬ"])
+            for question in prep.likely_questions[:4]:
+                lines.append(f"• {question}")
         lines.extend(["", f"Сообщение: {message_text[:800]}"])
         self.send_text("\n".join(lines))
 

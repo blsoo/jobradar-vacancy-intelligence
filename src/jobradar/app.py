@@ -12,6 +12,9 @@ from .storage import VacancyStore
 from .telegram import TelegramClient
 
 
+DIGEST_COOLDOWN_SECONDS = 30 * 60
+DIGEST_SIZE = 3
+
 SKIP_REASONS = {
     "salary": "зарплата",
     "office": "офис / география",
@@ -38,16 +41,40 @@ def collect(settings: Settings, store: VacancyStore) -> int:
     return len(vacancies)
 
 
-def push_new(settings: Settings, store: VacancyStore, telegram: TelegramClient) -> int:
+def _digest_due(store: VacancyStore, now_epoch: int, *, force: bool = False) -> bool:
+    if force:
+        return True
+    raw = store.get_setting("last_digest_epoch") or "0"
+    try:
+        last = max(0, int(raw))
+    except ValueError:
+        last = 0
+    return last == 0 or now_epoch - last >= DIGEST_COOLDOWN_SECONDS
+
+
+def push_new(
+    settings: Settings,
+    store: VacancyStore,
+    telegram: TelegramClient,
+    *,
+    force: bool = False,
+) -> int:
     if not telegram.can_send:
         return 0
-    queue = store.unsent(settings.score_threshold, settings.max_push_per_cycle)
-    sent = 0
+    now_epoch = int(time.time())
+    if not _digest_due(store, now_epoch, force=force):
+        return 0
+
+    limit = max(1, min(DIGEST_SIZE, settings.max_push_per_cycle))
+    queue = store.unsent(settings.score_threshold, limit)
+    if not queue:
+        return 0
+
+    telegram.send_digest(queue)
     for item in queue:
-        telegram.send_vacancy(item)
         store.mark_sent(int(item.local_id))
-        sent += 1
-    return sent
+    store.set_setting("last_digest_epoch", str(now_epoch))
+    return len(queue)
 
 
 def _chat_id_from_update(update: dict) -> str:
@@ -63,16 +90,13 @@ def _authorized_chat(telegram: TelegramClient, update: dict) -> bool:
 
 def _stats_text(store: VacancyStore) -> str:
     stats = store.stats()
-    reasons = store.skip_reason_stats()
-    reason_text = ", ".join(f"{SKIP_REASONS.get(k, k)}: {v}" for k, v in list(reasons.items())[:4])
     return (
         "📊 JobRadar\n"
         f"Вакансий в базе: {stats['total']}\n"
-        f"Отправлено: {stats['sent']}\n"
+        f"Показано: {stats['sent']}\n"
         f"Сохранено: {stats['saved']}\n"
         f"К отклику: {stats['apply_requested']}\n"
         f"Пропущено: {stats['skipped']}"
-        + (f"\nПричины пропуска: {reason_text}" if reason_text else "")
     )
 
 
@@ -86,9 +110,10 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
             telegram.bind_chat(incoming_chat_id)
             store.set_setting("telegram_chat_id", incoming_chat_id)
             telegram.send_text(
-                "✅ JobRadar привязан к этому чату.\n"
-                "Теперь сюда будут приходить только вакансии выше порога.\n"
-                "Команда /stats покажет текущую воронку."
+                "✅ JobRadar привязан.\n"
+                "Тихий режим: максимум один дайджест за 30 минут и до 3 лучших вакансий в нём.\n"
+                "На каждую вакансию: 🔥 Отклик / 📌 Сохранить / ❌ Мимо.\n"
+                "/stats — статистика."
             )
         return
 
@@ -99,7 +124,9 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         return
 
     if text == "/start":
-        telegram.send_text("✅ JobRadar уже привязан к этому чату. /stats — статистика.")
+        telegram.send_text(
+            "✅ JobRadar работает в тихом режиме: до 3 лучших вакансий одним сообщением, не чаще раза в 30 минут. /stats — статистика."
+        )
         return
 
     if text == "/stats":
@@ -130,25 +157,11 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         return
 
     if action == "skip":
-        telegram.answer_callback(callback_id, "Почему пропускаем?")
-        telegram.send_text(
-            f"❌ Почему не подходит «{item.vacancy.title}»?",
-            reply_markup={
-                "inline_keyboard": [
-                    [
-                        {"text": "💸 Зарплата", "callback_data": f"skipr:{local_id}:salary"},
-                        {"text": "🏢 Офис", "callback_data": f"skipr:{local_id}:office"},
-                    ],
-                    [
-                        {"text": "📈 Seniority", "callback_data": f"skipr:{local_id}:seniority"},
-                        {"text": "🧩 Стек", "callback_data": f"skipr:{local_id}:stack"},
-                    ],
-                    [{"text": "Другое", "callback_data": f"skipr:{local_id}:other"}],
-                ]
-            },
-        )
+        store.decide(local_id, "skipped", reason="other")
+        telegram.answer_callback(callback_id, "❌ Пропущено")
         return
 
+    # Compatibility with older skip-reason buttons already sent before quiet mode.
     if action == "skipr" and extra in SKIP_REASONS:
         store.decide(local_id, "skipped", reason=extra)
         telegram.answer_callback(callback_id, f"❌ Учёл: {SKIP_REASONS[extra]}")
@@ -161,10 +174,10 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         telegram.send_text(
             "🔥 Подготовленный отклик\n\n"
             f"{letter}\n\n"
-            "Кнопка ведёт прямо в форму отклика HH, если HH отдал её для вакансии. После реальной отправки отметь это ниже.",
+            "Сейчас реальная отправка на HH требует действия на стороне HH. Открой форму, отправь и отметь результат второй кнопкой.",
             reply_markup={
                 "inline_keyboard": [
-                    [{"text": "⚡ Открыть форму отклика HH", "url": item.vacancy.application_url}],
+                    [{"text": "⚡ Открыть форму HH", "url": item.vacancy.application_url}],
                     [{"text": "✅ Я откликнулся", "callback_data": f"applied:{local_id}"}],
                 ]
             },
@@ -269,8 +282,6 @@ def run_cron(settings: Settings) -> int:
         sent = 0
         was_bound = telegram.can_send
 
-        # Chat control is independent from vacancy collection. A temporary HH
-        # outage must not stop /start, /stats or callback buttons from working.
         try:
             processed = poll_updates(settings, store, telegram, timeout=0)
         except Exception as exc:
@@ -279,8 +290,6 @@ def run_cron(settings: Settings) -> int:
         just_bound = (not was_bound) and telegram.can_send
 
         if _collection_due(store, settings.poll_seconds, now_epoch):
-            # Record the attempt before network I/O so a failing source does not
-            # get hammered every minute. Normal retry cadence remains 5 minutes.
             store.set_setting("last_collection_epoch", str(now_epoch))
             try:
                 found = collect(settings, store)
@@ -289,11 +298,11 @@ def run_cron(settings: Settings) -> int:
             except Exception as exc:
                 print(f"collection error: {exc}", file=sys.stderr)
 
-        # Do not drain the backlog every minute. Send one bounded batch only
-        # after the owner first binds or after a successful vacancy scan.
+        # Search can run frequently, but notifications stay quiet. A digest is
+        # at most three vacancies and no more than once per 30 minutes.
         if just_bound or collected:
             try:
-                sent = push_new(settings, store, telegram)
+                sent = push_new(settings, store, telegram, force=just_bound)
             except Exception as exc:
                 print(f"telegram push error: {exc}", file=sys.stderr)
 

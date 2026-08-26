@@ -90,7 +90,6 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
                 "Теперь сюда будут приходить только вакансии выше порога.\n"
                 "Команда /stats покажет текущую воронку."
             )
-            push_new(settings, store, telegram)
         return
 
     if not _authorized_chat(telegram, update):
@@ -268,6 +267,7 @@ def run_cron(settings: Settings) -> int:
         collected = False
         processed = 0
         sent = 0
+        was_bound = telegram.can_send
 
         # Chat control is independent from vacancy collection. A temporary HH
         # outage must not stop /start, /stats or callback buttons from working.
@@ -275,6 +275,8 @@ def run_cron(settings: Settings) -> int:
             processed = poll_updates(settings, store, telegram, timeout=0)
         except Exception as exc:
             print(f"telegram poll error: {exc}", file=sys.stderr)
+
+        just_bound = (not was_bound) and telegram.can_send
 
         if _collection_due(store, settings.poll_seconds, now_epoch):
             # Record the attempt before network I/O so a failing source does not
@@ -287,10 +289,13 @@ def run_cron(settings: Settings) -> int:
             except Exception as exc:
                 print(f"collection error: {exc}", file=sys.stderr)
 
-        try:
-            sent = push_new(settings, store, telegram)
-        except Exception as exc:
-            print(f"telegram push error: {exc}", file=sys.stderr)
+        # Do not drain the backlog every minute. Send one bounded batch only
+        # after the owner first binds or after a successful vacancy scan.
+        if just_bound or collected:
+            try:
+                sent = push_new(settings, store, telegram)
+            except Exception as exc:
+                print(f"telegram push error: {exc}", file=sys.stderr)
 
         print(
             f"JobRadar cron: collection_success={int(collected)} collected={found} "

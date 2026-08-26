@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from email.header import Header
 import unittest
 
 from jobradar.email_inbox import is_hh_recruiting_message, parse_email
@@ -19,6 +20,51 @@ class EmailInboxTests(unittest.TestCase):
         msg = parse_email(42, raw)
         self.assertEqual(msg.vacancy_id, "123456")
         self.assertIn("собеседование", msg.text)
+        self.assertTrue(is_hh_recruiting_message(msg))
+
+    def test_rejects_hh_resume_moderation_and_strips_css(self) -> None:
+        subject = Header("Ваше резюме прошло модерацию", "utf-8").encode()
+        html = """
+        <html>
+          <head>
+            <style>
+              #outlook a { padding: 0; }
+              body { margin: 0; padding: 0; }
+              .mj-column-per-100 { width: 100% !important; }
+            </style>
+          </head>
+          <body>
+            <h1>Ваше резюме прошло модерацию</h1>
+            <p>Теперь оно доступно работодателям.</p>
+          </body>
+        </html>
+        """
+        raw = (
+            "From: hh.ru <noreply@hh.ru>\r\n"
+            f"Subject: {subject}\r\n"
+            "Message-ID: <resume-moderation@example>\r\n"
+            "Date: Wed, 26 Aug 2026 17:20:00 +0300\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n\r\n"
+            + html
+        ).encode("utf-8")
+
+        msg = parse_email(43, raw)
+        self.assertIn("Ваше резюме прошло модерацию", msg.text)
+        self.assertNotIn("#outlook", msg.text)
+        self.assertNotIn("mj-column", msg.text)
+        self.assertNotIn("padding:", msg.text)
+        self.assertFalse(is_hh_recruiting_message(msg))
+
+    def test_accepts_neutral_hh_employer_message(self) -> None:
+        subject = Header("Новое сообщение от работодателя", "utf-8").encode()
+        raw = (
+            "From: hh.ru <noreply@hh.ru>\r\n"
+            f"Subject: {subject}\r\n"
+            "Message-ID: <employer-message@example>\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            "Новое сообщение от работодателя: Здравствуйте, готовы обсудить ваш опыт."
+        ).encode("utf-8")
+        msg = parse_email(44, raw)
         self.assertTrue(is_hh_recruiting_message(msg))
 
     def test_rejects_unrelated_mail(self) -> None:

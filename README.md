@@ -2,72 +2,79 @@
 
 [![JobRadar checks](https://github.com/blsoo/jobradar-vacancy-intelligence/actions/workflows/ci.yml/badge.svg)](https://github.com/blsoo/jobradar-vacancy-intelligence/actions/workflows/ci.yml)
 
-**Vacancy intelligence · HH API · explainable scoring · Telegram actions · SQLite**
+**Vacancy intelligence · HH discovery · explainable scoring · Telegram actions · SQLite**
 
-JobRadar turns a noisy job feed into a short ranked queue of opportunities worth reviewing and applying to.
+JobRadar turns a noisy vacancy feed into a small ranked queue of opportunities worth reviewing.
 
 ```text
-HH vacancy search
+HH discovery
     -> normalize
     -> deterministic score
     -> deduplicate
     -> SQLite state
-    -> Telegram card
-    -> save / skip / prepare application
-    -> feedback history
+    -> quiet top-3 Telegram digest
+    -> apply / save / skip
+    -> application funnel
 ```
 
 ## Working MVP
 
 The current code can:
 
-- search vacancies through the public HeadHunter API;
+- discover HeadHunter vacancies through the API when authorized and use HH public RSS as the anonymous fallback;
 - rank them for a Junior System Analyst / Integration profile;
-- reward SQL, REST, HTTP, JSON, API, requirements, UML/BPMN, integrations and remote work;
+- reward SQL, REST, HTTP, JSON, API, requirements, UML/BPMN, integrations, junior/no-experience signals, salary target and remote work;
 - penalize clearly senior/lead roles;
-- store vacancies and decisions in SQLite;
-- deduplicate by `(source, external_id)`;
-- prevent repeated delivery after a successful Telegram send;
-- send ranked Telegram cards with inline actions;
-- use HH `apply_alternate_url` when available so the button opens the response form directly;
+- deduplicate by `(source, external_id)` and store state in SQLite;
+- bind one owner Telegram chat on the first `/start`;
+- send only vacancies above the configured quality threshold;
+- combine up to three best new vacancies into one Telegram digest;
+- rate-limit unsolicited vacancy digests to at most one per 30 minutes;
+- show salary, format, a profile-match score and a human-readable screening-chance band;
+- expose exactly three first-level actions per vacancy: `Apply`, `Save`, `Skip`;
 - generate a short cover letter only from portfolio evidence actually matched to the vacancy;
-- ask why a vacancy was skipped: salary, office/geography, seniority, stack or other;
-- store structured decision events for a future feedback-aware ranker;
-- bind the owner chat automatically on the first `/start` and persist that binding;
-- reject mutations from other Telegram chats after binding;
-- keep application state fail-closed instead of claiming a response was sent when it was not.
+- keep repeated callbacks idempotent;
+- keep application state fail-closed instead of pretending HH accepted a response when it did not.
 
 ## Telegram flow
 
 ```text
-🔥 87/100 · Junior System Analyst
-Company · Remote
-Salary: 70 000–90 000 RUB
+🎯 JobRadar · лучшие новые вакансии
 
-Matched: SQL, REST, JSON, API
-Risks: no explicit blocker detected
+1️⃣ Junior System Analyst
+Company · Москва
+💰 70 000–90 000 ₽ · 🏠 Удалённо
+📈 Шанс первичного скрининга: высокий · 86/100
+✅ SQL · REST · требования · без опыта
 
-[🔥 Prepare application] [📌 Save]
-[❌ Skip]                [⚡ HH response form]
+2️⃣ ...
+3️⃣ ...
+
+[1 🔥 Отклик] [1 📌 Сохранить] [1 ❌ Мимо]
+[2 🔥 Отклик] [2 📌 Сохранить] [2 ❌ Мимо]
+[3 🔥 Отклик] [3 📌 Сохранить] [3 ❌ Мимо]
 ```
 
-`🔥 Prepare application` stores `apply_requested`, prepares a truthful short cover letter and opens the vacancy-specific HH response form when HH provides one.
+The screening label is an **explainable heuristic**, not an empirical probability of receiving an offer. It reflects how strongly the vacancy matches the configured junior profile and known portfolio evidence.
 
-After the real response is sent, `✅ I applied` moves the local funnel to `applied`.
+`🔥 Отклик` stores `apply_requested`, prepares a truthful cover letter and provides the HH application page. Until an official applicant OAuth adapter confirms a platform-side response, JobRadar does not claim that an application was sent.
 
-`❌ Skip` asks for a structured reason. Those reasons are already visible through `/stats` and are intended to improve ranking later.
+`📌 Сохранить` and `❌ Мимо` are one-tap actions and do not create extra chat messages.
+
+## Anti-spam behaviour
+
+Search and Telegram control are intentionally separated:
+
+- vacancy discovery may run every few minutes;
+- low-score vacancies stay silent;
+- old backlog is not drained into Telegram;
+- at most three opportunities are shown in one digest;
+- unsolicited digests have a 30-minute cooldown;
+- button callbacks and `/stats` can still be processed every minute.
 
 ## First-run Telegram binding
 
-`TELEGRAM_CHAT_ID` is optional. If it is empty, JobRadar starts in an unbound state and waits for the first `/start` message. That chat ID is stored in the persistent database and becomes the only authorized chat for mutations and vacancy pushes.
-
-For a fixed deployment, `TELEGRAM_CHAT_ID` may still be provided explicitly and takes precedence over the persisted value.
-
-## Why application submission is a separate boundary
-
-Public vacancy discovery does not require applicant OAuth. Actual platform-side mutations are different: JobRadar must not silently claim that an application succeeded.
-
-A future OAuth adapter is tracked in [issue #1](https://github.com/blsoo/jobradar-vacancy-intelligence/issues/1). It may move a vacancy to `applied` only after the official platform confirms success or the user explicitly confirms the real submission.
+`TELEGRAM_CHAT_ID` is optional. If empty, the first `/start` claims the bot and persists the owner chat ID. Other chats cannot mutate JobRadar state after binding.
 
 ## Run
 
@@ -78,13 +85,17 @@ cp .env.example .env
 PYTHONPATH=src python -m jobradar.app once
 ```
 
-Continuous collection + Telegram callbacks:
+Continuous worker:
 
 ```bash
 PYTHONPATH=src python -m jobradar.app run
 ```
 
-Windows PowerShell can use the same `.env` file because JobRadar loads it itself.
+Cron-friendly short-lived worker:
+
+```bash
+PYTHONPATH=src python -m jobradar.app cron
+```
 
 Tests:
 
@@ -96,17 +107,15 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 
 See [`.env.example`](.env.example).
 
-Important runtime values:
+Important values:
 
-- `TELEGRAM_BOT_TOKEN` — required Telegram bot secret;
-- `TELEGRAM_CHAT_ID` — optional fixed owner chat; otherwise first `/start` claims the bot;
-- `JOBRADAR_SCORE_THRESHOLD` — minimum score for push delivery;
+- `TELEGRAM_BOT_TOKEN` — Telegram secret, never committed;
+- `TELEGRAM_CHAT_ID` — optional fixed owner chat;
+- `JOBRADAR_SCORE_THRESHOLD` — minimum score for Telegram delivery, default `70`;
+- `JOBRADAR_MAX_PUSH_PER_CYCLE` — hard cap per digest, default `3`;
 - `JOBRADAR_TARGET_SALARY_RUB` — salary preference signal;
 - `HH_SEARCH_QUERIES` — semicolon-separated search phrases;
-- `HH_AREA` — HH area ID;
-- `HH_USER_AGENT` — required client identity header.
-
-Secrets are never committed.
+- `HH_AREA` — HH area ID.
 
 ## Architecture
 
@@ -115,16 +124,15 @@ See [ARCHITECTURE.md](ARCHITECTURE.md).
 Core invariants:
 
 1. vacancy identity is stable by `(source, external_id)`;
-2. Telegram delivery is marked only after a successful send;
+2. delivery is marked only after a successful Telegram send;
 3. repeated identical decisions are idempotent;
-4. owner chat binding is persistent and only one chat may mutate state;
+4. owner chat binding is persistent;
 5. scoring remains explainable;
 6. `applied` never means merely "an attempt was made";
-7. external OAuth mutations fail closed.
+7. external OAuth mutations fail closed;
+8. discovery frequency must not imply notification frequency.
 
 ## Roadmap
-
-Real next steps are tracked as issues with acceptance criteria:
 
 - [#1 HH applicant OAuth and safe application adapter](https://github.com/blsoo/jobradar-vacancy-intelligence/issues/1)
 - [#2 PostgreSQL repository and migrations](https://github.com/blsoo/jobradar-vacancy-intelligence/issues/2)
@@ -132,4 +140,4 @@ Real next steps are tracked as issues with acceptance criteria:
 
 ## Portfolio value
 
-This is not only an architecture exercise: the repository contains executable code for external REST integration, normalization, ranking, persistence, idempotent delivery, Telegram callbacks, structured feedback, application-state modelling, tests and CI.
+The repository demonstrates external integration, normalization, deterministic ranking, persistence, deduplication, idempotent Telegram callbacks, rate-limited notifications, application-state modelling, tests and CI without presenting a design prototype as production automation.

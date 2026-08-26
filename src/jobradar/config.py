@@ -66,7 +66,7 @@ class Settings:
             hh_per_page=int(os.getenv("HH_PER_PAGE", "50")),
             hh_user_agent=os.getenv(
                 "HH_USER_AGENT",
-                "JobRadar/0.1 (github.com/blsoo/jobradar-vacancy-intelligence)",
+                "JobRadar/0.1 (317558701+blsoo@users.noreply.github.com)",
             ),
             hh_oauth_token=os.getenv("HH_OAUTH_TOKEN", "").strip(),
             hh_resume_id=os.getenv("HH_RESUME_ID", "").strip(),

@@ -293,13 +293,14 @@ class VacancyStore:
         chat_id: str = "",
         sender_name: str = "Работодатель",
     ) -> tuple[bool, int]:
-        application_id = self.ensure_application(str(external_vacancy_id), status="in_progress")
-        exists = self.conn.execute(
-            "SELECT id FROM employer_events WHERE source_event_id=?",
+        existing = self.conn.execute(
+            "SELECT application_id FROM employer_events WHERE source_event_id=?",
             (str(source_event_id),),
         ).fetchone()
-        if exists:
-            return False, application_id
+        if existing:
+            return False, int(existing["application_id"])
+
+        application_id = self.ensure_application(str(external_vacancy_id), status="in_progress")
         self.conn.execute(
             """
             INSERT INTO employer_events(

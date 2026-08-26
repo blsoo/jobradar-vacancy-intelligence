@@ -16,13 +16,23 @@ class HHClient:
     RSS_BASE_URL = "https://hh.ru/search/vacancy/rss"
     BROWSER_USER_AGENT = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "Chrome/126 Safari/537.36 JobRadar/0.1"
+        "Chrome/126 Safari/537.36 JobRadar/0.2"
     )
 
     def __init__(self, user_agent: str, oauth_token: str = "", timeout: int = 15) -> None:
         self.user_agent = user_agent
         self.oauth_token = oauth_token.strip()
         self.timeout = timeout
+
+    def _api_headers(self) -> dict[str, str]:
+        headers = {
+            "HH-User-Agent": self.user_agent,
+            "User-Agent": self.user_agent,
+            "Accept": "application/json",
+        }
+        if self.oauth_token:
+            headers["Authorization"] = f"Bearer {self.oauth_token}"
+        return headers
 
     @staticmethod
     def _plain_text(value: str) -> str:
@@ -93,6 +103,15 @@ class HHClient:
             snippet=cls._plain_text(raw_description),
         )
 
+    def get_vacancy(self, vacancy_id: str) -> Vacancy:
+        request = Request(
+            f"{self.API_BASE_URL}/vacancies/{vacancy_id}",
+            headers=self._api_headers(),
+        )
+        with urlopen(request, timeout=self.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return Vacancy.from_hh_item(payload)
+
     def _search_api(
         self,
         query: str,
@@ -111,14 +130,10 @@ class HHClient:
                 "period": 7,
             }
         )
-        headers = {
-            "HH-User-Agent": self.user_agent,
-            "User-Agent": self.user_agent,
-            "Accept": "application/json",
-        }
-        if self.oauth_token:
-            headers["Authorization"] = f"Bearer {self.oauth_token}"
-        request = Request(f"{self.API_BASE_URL}/vacancies?{params}", headers=headers)
+        request = Request(
+            f"{self.API_BASE_URL}/vacancies?{params}",
+            headers=self._api_headers(),
+        )
         with urlopen(request, timeout=self.timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
         return [Vacancy.from_hh_item(item) for item in payload.get("items", [])]
@@ -150,8 +165,6 @@ class HHClient:
         per_page: int = 50,
         page: int = 0,
     ) -> list[Vacancy]:
-        # HH currently challenges anonymous API vacancy searches. Use the official
-        # API when OAuth exists; otherwise use HH's public RSS search feed.
         if not self.oauth_token:
             return self._search_rss(query, area=area)
         try:

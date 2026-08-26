@@ -22,7 +22,7 @@ SKIP_REASONS = {
 
 
 def collect(settings: Settings, store: VacancyStore) -> int:
-    client = HHClient(settings.hh_user_agent)
+    client = HHClient(settings.hh_user_agent, settings.hh_oauth_token)
     vacancies = client.search_many(
         settings.hh_search_queries,
         area=settings.hh_area,
@@ -259,26 +259,41 @@ def run_tick(settings: Settings) -> int:
 
 
 def run_cron(settings: Settings) -> int:
-    """Short-lived worker intended to run once per minute from user cron.
-
-    Telegram updates are checked every invocation, while vacancy collection follows
-    JOBRADAR_POLL_SECONDS (300 seconds by default).
-    """
+    """Short-lived resilient worker intended to run once per minute from user cron."""
     store = VacancyStore(settings.db_path)
     telegram = _telegram_client(settings, store)
     try:
         now_epoch = int(time.time())
         found = 0
         collected = False
-        if _collection_due(store, settings.poll_seconds, now_epoch):
-            found = collect(settings, store)
-            store.set_setting("last_collection_epoch", str(now_epoch))
-            collected = True
+        processed = 0
+        sent = 0
 
-        processed = poll_updates(settings, store, telegram, timeout=0)
-        sent = push_new(settings, store, telegram)
+        # Chat control is independent from vacancy collection. A temporary HH
+        # outage must not stop /start, /stats or callback buttons from working.
+        try:
+            processed = poll_updates(settings, store, telegram, timeout=0)
+        except Exception as exc:
+            print(f"telegram poll error: {exc}", file=sys.stderr)
+
+        if _collection_due(store, settings.poll_seconds, now_epoch):
+            # Record the attempt before network I/O so a failing source does not
+            # get hammered every minute. Normal retry cadence remains 5 minutes.
+            store.set_setting("last_collection_epoch", str(now_epoch))
+            try:
+                found = collect(settings, store)
+                store.set_setting("last_collection_success_epoch", str(now_epoch))
+                collected = True
+            except Exception as exc:
+                print(f"collection error: {exc}", file=sys.stderr)
+
+        try:
+            sent = push_new(settings, store, telegram)
+        except Exception as exc:
+            print(f"telegram push error: {exc}", file=sys.stderr)
+
         print(
-            f"JobRadar cron: collection_due={int(collected)} collected={found} "
+            f"JobRadar cron: collection_success={int(collected)} collected={found} "
             f"telegram_updates={processed} pushed={sent} stats={store.stats()}"
         )
         return 0

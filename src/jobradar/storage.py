@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime
 import json
 import sqlite3
 from typing import Iterable
@@ -44,8 +45,63 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vacancy_id INTEGER REFERENCES vacancies(id),
+    source TEXT NOT NULL DEFAULT 'hh',
+    external_vacancy_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'applied',
+    applied_at TEXT,
+    last_employer_event_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source, external_vacancy_id)
+);
+
+CREATE TABLE IF NOT EXISTS employer_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER NOT NULL REFERENCES applications(id),
+    chat_id TEXT,
+    source_event_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    sender_name TEXT,
+    text TEXT NOT NULL,
+    event_at TEXT,
+    notified_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS interviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER NOT NULL REFERENCES applications(id),
+    source_event_id TEXT,
+    scheduled_at TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    evidence TEXT,
+    status TEXT NOT NULL DEFAULT 'scheduled',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(application_id, scheduled_at)
+);
+
+CREATE TABLE IF NOT EXISTS interview_reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    interview_id INTEGER NOT NULL REFERENCES interviews(id),
+    kind TEXT NOT NULL,
+    remind_at TEXT NOT NULL,
+    sent_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(interview_id, kind)
+);
+
 CREATE INDEX IF NOT EXISTS idx_vacancies_queue
 ON vacancies(decision, sent_at, score DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_employer_events_notification
+ON employer_events(notified_at, event_at);
+CREATE INDEX IF NOT EXISTS idx_interview_reminders_due
+ON interview_reminders(sent_at, remind_at);
 """
 
 
@@ -81,6 +137,13 @@ class VacancyStore:
             (key, value),
         )
         self.conn.commit()
+
+    def settings_by_prefix(self, prefix: str) -> dict[str, str]:
+        rows = self.conn.execute(
+            "SELECT key, value FROM runtime_settings WHERE key LIKE ?",
+            (f"{prefix}%",),
+        ).fetchall()
+        return {str(row["key"]): str(row["value"]) for row in rows}
 
     def upsert(self, ranked: RankedVacancy) -> int:
         v = ranked.vacancy
@@ -145,6 +208,13 @@ class VacancyStore:
         row = self.conn.execute("SELECT * FROM vacancies WHERE id=?", (local_id,)).fetchone()
         return self._to_ranked(row) if row else None
 
+    def get_by_external_id(self, source: str, external_id: str) -> RankedVacancy | None:
+        row = self.conn.execute(
+            "SELECT * FROM vacancies WHERE source=? AND external_id=?",
+            (source, str(external_id)),
+        ).fetchone()
+        return self._to_ranked(row) if row else None
+
     def mark_sent(self, local_id: int) -> None:
         self.conn.execute(
             "UPDATE vacancies SET sent_at=COALESCE(sent_at, CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -157,7 +227,7 @@ class VacancyStore:
         if decision not in allowed:
             raise ValueError(f"unsupported decision: {decision}")
         row = self.conn.execute(
-            "SELECT decision, decision_reason FROM vacancies WHERE id=?", (local_id,)
+            "SELECT decision, decision_reason, external_id FROM vacancies WHERE id=?", (local_id,)
         ).fetchone()
         if row is None:
             raise KeyError(f"vacancy not found: {local_id}")
@@ -175,8 +245,166 @@ class VacancyStore:
             "INSERT INTO decision_events(vacancy_id, decision, reason) VALUES (?, ?, ?)",
             (local_id, decision, reason),
         )
+        if decision == "applied":
+            self.ensure_application(str(row["external_id"]), vacancy_id=local_id, status="applied")
         self.conn.commit()
         return True
+
+    def ensure_application(
+        self,
+        external_vacancy_id: str,
+        *,
+        vacancy_id: int | None = None,
+        status: str = "applied",
+        applied_at: str | None = None,
+    ) -> int:
+        if vacancy_id is None:
+            row = self.conn.execute(
+                "SELECT id FROM vacancies WHERE source='hh' AND external_id=?",
+                (str(external_vacancy_id),),
+            ).fetchone()
+            vacancy_id = int(row["id"]) if row else None
+        self.conn.execute(
+            """
+            INSERT INTO applications(vacancy_id, source, external_vacancy_id, status, applied_at)
+            VALUES (?, 'hh', ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+            ON CONFLICT(source, external_vacancy_id) DO UPDATE SET
+                vacancy_id=COALESCE(applications.vacancy_id, excluded.vacancy_id),
+                status=excluded.status,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (vacancy_id, str(external_vacancy_id), status, applied_at),
+        )
+        row = self.conn.execute(
+            "SELECT id FROM applications WHERE source='hh' AND external_vacancy_id=?",
+            (str(external_vacancy_id),),
+        ).fetchone()
+        self.conn.commit()
+        return int(row["id"])
+
+    def record_employer_event(
+        self,
+        *,
+        external_vacancy_id: str,
+        source_event_id: str,
+        event_type: str,
+        text: str,
+        event_at: str,
+        chat_id: str = "",
+        sender_name: str = "Работодатель",
+    ) -> tuple[bool, int]:
+        application_id = self.ensure_application(str(external_vacancy_id), status="in_progress")
+        exists = self.conn.execute(
+            "SELECT id FROM employer_events WHERE source_event_id=?",
+            (str(source_event_id),),
+        ).fetchone()
+        if exists:
+            return False, application_id
+        self.conn.execute(
+            """
+            INSERT INTO employer_events(
+                application_id, chat_id, source_event_id, event_type,
+                sender_name, text, event_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (application_id, chat_id, str(source_event_id), event_type, sender_name, text, event_at),
+        )
+        status = "invited" if event_type == "positive" else ("rejected" if event_type == "rejection" else "in_progress")
+        self.conn.execute(
+            """
+            UPDATE applications
+            SET status=?, last_employer_event_at=?, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            (status, event_at or None, application_id),
+        )
+        self.conn.commit()
+        return True, application_id
+
+    def mark_employer_event_notified(self, source_event_id: str) -> None:
+        self.conn.execute(
+            "UPDATE employer_events SET notified_at=COALESCE(notified_at, CURRENT_TIMESTAMP) WHERE source_event_id=?",
+            (str(source_event_id),),
+        )
+        self.conn.commit()
+
+    def schedule_interview(
+        self,
+        *,
+        application_id: int,
+        scheduled_at: datetime,
+        timezone: str,
+        confidence: str,
+        evidence: str,
+        source_event_id: str,
+        reminders: Iterable[tuple[str, datetime]],
+    ) -> int:
+        scheduled_iso = scheduled_at.isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO interviews(
+                application_id, source_event_id, scheduled_at, timezone, confidence, evidence
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(application_id, scheduled_at) DO UPDATE SET
+                source_event_id=excluded.source_event_id,
+                confidence=excluded.confidence,
+                evidence=excluded.evidence,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (application_id, source_event_id, scheduled_iso, timezone, confidence, evidence),
+        )
+        row = self.conn.execute(
+            "SELECT id FROM interviews WHERE application_id=? AND scheduled_at=?",
+            (application_id, scheduled_iso),
+        ).fetchone()
+        interview_id = int(row["id"])
+        for kind, remind_at in reminders:
+            self.conn.execute(
+                """
+                INSERT INTO interview_reminders(interview_id, kind, remind_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(interview_id, kind) DO UPDATE SET remind_at=excluded.remind_at
+                """,
+                (interview_id, kind, remind_at.isoformat()),
+            )
+        self.conn.commit()
+        return interview_id
+
+    def due_reminders(self, now: datetime) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT r.id AS reminder_id, r.kind, r.remind_at,
+                   i.id AS interview_id, i.scheduled_at, i.timezone,
+                   a.external_vacancy_id,
+                   v.title, v.company, v.url
+            FROM interview_reminders r
+            JOIN interviews i ON i.id=r.interview_id
+            JOIN applications a ON a.id=i.application_id
+            LEFT JOIN vacancies v ON v.id=a.vacancy_id
+            WHERE r.sent_at IS NULL
+              AND i.status='scheduled'
+              AND r.remind_at <= ?
+            ORDER BY r.remind_at ASC
+            """,
+            (now.isoformat(),),
+        ).fetchall()
+
+    def mark_reminder_sent(self, reminder_id: int) -> None:
+        self.conn.execute(
+            "UPDATE interview_reminders SET sent_at=COALESCE(sent_at, CURRENT_TIMESTAMP) WHERE id=?",
+            (int(reminder_id),),
+        )
+        self.conn.commit()
+
+    def application_stats(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS total FROM applications GROUP BY status"
+        ).fetchall()
+        result = {str(row["status"]): int(row["total"]) for row in rows}
+        result["interviews"] = int(
+            self.conn.execute("SELECT COUNT(*) FROM interviews WHERE status='scheduled'").fetchone()[0]
+        )
+        return result
 
     def decision_event_count(self, local_id: int) -> int:
         return int(

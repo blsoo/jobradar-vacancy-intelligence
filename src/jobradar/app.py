@@ -9,6 +9,7 @@ from .config import Settings
 from .cover_letter import build_cover_letter
 from .hh_client import HHClient
 from .hh_inbox import HHInboxClient, classify_employer_message
+from .hh_oauth import HHOAuthManager
 from .interviews import detect_interview_datetime, reminder_times
 from .models import RankedVacancy
 from .scoring import score_vacancy
@@ -28,8 +29,20 @@ SKIP_REASONS = {
 }
 
 
+def _oauth_manager(settings: Settings, store: VacancyStore) -> HHOAuthManager:
+    return HHOAuthManager(
+        store,
+        client_id=settings.hh_client_id,
+        client_secret=settings.hh_client_secret,
+        redirect_uri=settings.hh_redirect_uri,
+        bootstrap_access_token=settings.hh_oauth_token,
+        user_agent=settings.hh_user_agent,
+    )
+
+
 def collect(settings: Settings, store: VacancyStore) -> int:
-    client = HHClient(settings.hh_user_agent, settings.hh_oauth_token)
+    token = _oauth_manager(settings, store).access_token()
+    client = HHClient(settings.hh_user_agent, token)
     vacancies = client.search_many(
         settings.hh_search_queries,
         area=settings.hh_area,
@@ -68,12 +81,10 @@ def push_new(
     now_epoch = int(time.time())
     if not _digest_due(store, now_epoch, force=force):
         return 0
-
     limit = max(1, min(DIGEST_SIZE, settings.max_push_per_cycle))
     queue = store.unsent(settings.score_threshold, limit)
     if not queue:
         return 0
-
     telegram.send_digest(queue, target_salary_rub=settings.target_salary_rub)
     for item in queue:
         store.mark_sent(int(item.local_id))
@@ -110,9 +121,73 @@ def _stats_text(store: VacancyStore) -> str:
     )
 
 
+def _handle_hh_auth_command(
+    settings: Settings,
+    store: VacancyStore,
+    telegram: TelegramClient,
+    raw_text: str,
+    message: dict,
+) -> bool:
+    lower = raw_text.lower()
+    oauth = _oauth_manager(settings, store)
+
+    if lower == "/hh_status":
+        if oauth.connected():
+            telegram.send_text("🟢 HH OAuth подключён. Ответы работодателей и приглашения мониторятся.")
+        elif oauth.can_authorize:
+            telegram.send_text("🟡 HH OAuth готов к подключению. Нажми /hh_auth.")
+        else:
+            telegram.send_text("⚪ HH OAuth ещё не настроен: нужны client_id/client_secret приложения HH.")
+        return True
+
+    if lower == "/hh_auth":
+        if not oauth.can_authorize:
+            telegram.send_text("⚙️ Код для HH OAuth уже готов, но credentials приложения ещё не установлены на VPS.")
+            return True
+        url = oauth.authorization_url()
+        telegram.send_text(
+            "🔐 Подключение HeadHunter\n\n"
+            "1. Нажми кнопку и разреши доступ.\n"
+            "2. После редиректа скопируй ПОЛНЫЙ адрес из строки браузера.\n"
+            "3. Отправь его сюда: /hhcode <полный URL>\n\n"
+            "Authorization code одноразовый; сообщение с ним бот попробует удалить сразу после обработки.",
+            reply_markup={"inline_keyboard": [[{"text": "🔐 Авторизовать HH", "url": url}]]},
+        )
+        return True
+
+    if lower.startswith("/hhcode "):
+        redirect_value = raw_text[len("/hhcode "):].strip()
+        incoming_chat_id = _chat_id_from_update({"message": message})
+        message_id = message.get("message_id")
+        if incoming_chat_id and message_id:
+            try:
+                telegram.delete_message(incoming_chat_id, int(message_id))
+            except Exception:
+                pass
+        try:
+            token = oauth.exchange_redirect(redirect_value)
+            me = oauth.verify_applicant(token.access_token)
+            name = str(me.get("first_name") or me.get("name") or "аккаунт")
+            telegram.send_text(
+                "✅ HH ПОДКЛЮЧЁН\n"
+                f"Аккаунт: {name}\n"
+                "Теперь JobRadar раз в минуту проверяет ответы работодателей, сохраняет воронку, "
+                "ловит приглашения и ставит Telegram-напоминания на собеседования."
+            )
+        except Exception:
+            telegram.send_text(
+                "❌ Не удалось завершить HH OAuth. Code мог истечь или redirect/state не совпал. "
+                "Запусти /hh_auth ещё раз — токены и code в ошибку не вывожу."
+            )
+        return True
+
+    return False
+
+
 def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramClient, update: dict) -> None:
     message = update.get("message") or {}
-    text = (message.get("text") or "").strip().lower()
+    raw_text = (message.get("text") or "").strip()
+    text = raw_text.lower()
     incoming_chat_id = _chat_id_from_update(update)
 
     if not telegram.chat_id:
@@ -123,7 +198,7 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
                 "✅ JobRadar привязан.\n"
                 "Тихий режим: максимум один дайджест за 30 минут и до 3 лучших вакансий.\n"
                 "После HH OAuth бот также следит за ответами работодателей и собеседованиями.\n"
-                "/stats — воронка."
+                "/stats — воронка · /hh_status — связь с HH."
             )
         return
 
@@ -133,11 +208,15 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
             telegram.answer_callback(callback["id"], "Нет доступа")
         return
 
+    if raw_text and _handle_hh_auth_command(settings, store, telegram, raw_text, message):
+        return
+
     if text == "/start":
-        oauth = "подключён" if settings.hh_oauth_token else "ещё не подключён"
+        oauth = _oauth_manager(settings, store)
+        status = "подключён" if oauth.connected() else ("готов к /hh_auth" if oauth.can_authorize else "ещё не настроен")
         telegram.send_text(
             "✅ JobRadar работает в тихом режиме.\n"
-            f"HH Inbox: {oauth}.\n"
+            f"HH Inbox: {status}.\n"
             "/stats — вакансии, отклики, приглашения и собесы."
         )
         return
@@ -186,7 +265,7 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         telegram.send_text(
             "🔥 Подготовленный отклик\n\n"
             f"{letter}\n\n"
-            "Открой форму HH, отправь и нажми «Я откликнулся». После HH OAuth JobRadar будет сам отслеживать ответ работодателя.",
+            "Открой форму HH, отправь и нажми «Я откликнулся». После HH OAuth JobRadar сам отслеживает ответ работодателя.",
             reply_markup={
                 "inline_keyboard": [
                     [{"text": "⚡ Открыть форму HH", "url": item.vacancy.application_url}],
@@ -205,13 +284,7 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         telegram.answer_callback(callback_id, "Неизвестное действие")
 
 
-def poll_updates(
-    settings: Settings,
-    store: VacancyStore,
-    telegram: TelegramClient,
-    *,
-    timeout: int = 1,
-) -> int:
+def poll_updates(settings: Settings, store: VacancyStore, telegram: TelegramClient, *, timeout: int = 1) -> int:
     if not telegram.enabled:
         return 0
     raw_offset = store.get_setting("telegram_update_offset") or "0"
@@ -219,7 +292,6 @@ def poll_updates(
         offset = max(0, int(raw_offset))
     except ValueError:
         offset = 0
-
     processed = 0
     updates = telegram.get_updates(offset=offset, timeout=timeout)
     for update in sorted(updates, key=lambda item: int(item.get("update_id", 0))):
@@ -232,9 +304,10 @@ def poll_updates(
 
 def poll_hh_inbox(settings: Settings, store: VacancyStore, telegram: TelegramClient) -> int:
     """Notify once for new employer chat messages and schedule detected interviews."""
-    if not settings.hh_oauth_token or not telegram.can_send:
+    access_token = _oauth_manager(settings, store).access_token()
+    if not access_token or not telegram.can_send:
         return 0
-    client = HHInboxClient(settings.hh_oauth_token, settings.hh_user_agent)
+    client = HHInboxClient(access_token, settings.hh_user_agent)
     raw_seen = store.settings_by_prefix("hh_chat_last_")
     last_seen = {key.removeprefix("hh_chat_last_"): value for key, value in raw_seen.items()}
     messages = client.new_employer_messages(last_seen)
@@ -242,7 +315,6 @@ def poll_hh_inbox(settings: Settings, store: VacancyStore, telegram: TelegramCli
 
     for msg in messages:
         if not msg.vacancy_id:
-            # Still advance the cursor; an unbound chat must not notify forever.
             store.set_setting(f"hh_chat_last_{msg.chat_id}", msg.message_id)
             continue
         event_type = classify_employer_message(msg.text)
@@ -287,7 +359,6 @@ def poll_hh_inbox(settings: Settings, store: VacancyStore, telegram: TelegramCli
             store.mark_employer_event_notified(f"hh-chat:{msg.chat_id}:{msg.message_id}")
             processed += 1
         store.set_setting(f"hh_chat_last_{msg.chat_id}", msg.message_id)
-
     return processed
 
 
@@ -365,7 +436,6 @@ def run_tick(settings: Settings) -> int:
 
 
 def run_cron(settings: Settings) -> int:
-    """Short-lived resilient worker intended to run once per minute from user cron."""
     store = VacancyStore(settings.db_path)
     telegram = _telegram_client(settings, store)
     try:
@@ -381,7 +451,7 @@ def run_cron(settings: Settings) -> int:
         try:
             processed = poll_updates(settings, store, telegram, timeout=0)
         except Exception as exc:
-            print(f"telegram poll error: {exc}", file=sys.stderr)
+            print(f"telegram poll error: {type(exc).__name__}", file=sys.stderr)
 
         just_bound = (not was_bound) and telegram.can_send
 
@@ -392,25 +462,26 @@ def run_cron(settings: Settings) -> int:
                 store.set_setting("last_collection_success_epoch", str(now_epoch))
                 collected = True
             except Exception as exc:
-                print(f"collection error: {exc}", file=sys.stderr)
+                print(f"collection error: {type(exc).__name__}", file=sys.stderr)
 
-        if settings.hh_oauth_token and _due(store, "last_inbox_poll_epoch", settings.inbox_poll_seconds, now_epoch):
+        oauth = _oauth_manager(settings, store)
+        if oauth.connected() and _due(store, "last_inbox_poll_epoch", settings.inbox_poll_seconds, now_epoch):
             store.set_setting("last_inbox_poll_epoch", str(now_epoch))
             try:
                 inbox = poll_hh_inbox(settings, store, telegram)
             except Exception as exc:
-                print(f"HH inbox error: {exc}", file=sys.stderr)
+                print(f"HH inbox error: {type(exc).__name__}", file=sys.stderr)
 
         try:
             reminders = send_due_reminders(settings, store, telegram)
         except Exception as exc:
-            print(f"reminder error: {exc}", file=sys.stderr)
+            print(f"reminder error: {type(exc).__name__}", file=sys.stderr)
 
         if just_bound or collected:
             try:
                 sent = push_new(settings, store, telegram, force=just_bound)
             except Exception as exc:
-                print(f"telegram push error: {exc}", file=sys.stderr)
+                print(f"telegram push error: {type(exc).__name__}", file=sys.stderr)
 
         print(
             f"JobRadar cron: collection_success={int(collected)} collected={found} "
@@ -434,14 +505,14 @@ def run_forever(settings: Settings) -> int:
                 try:
                     cycle(settings, store, telegram)
                 except Exception as exc:
-                    print(f"collection error: {exc}", file=sys.stderr)
+                    print(f"collection error: {type(exc).__name__}", file=sys.stderr)
                 next_collect = now + max(settings.poll_seconds, 60)
 
-            if settings.hh_oauth_token and now >= next_inbox:
+            if _oauth_manager(settings, store).connected() and now >= next_inbox:
                 try:
                     poll_hh_inbox(settings, store, telegram)
                 except Exception as exc:
-                    print(f"HH inbox error: {exc}", file=sys.stderr)
+                    print(f"HH inbox error: {type(exc).__name__}", file=sys.stderr)
                 next_inbox = now + max(settings.inbox_poll_seconds, 60)
 
             try:
@@ -451,7 +522,7 @@ def run_forever(settings: Settings) -> int:
                 else:
                     time.sleep(2)
             except Exception as exc:
-                print(f"runtime error: {exc}", file=sys.stderr)
+                print(f"runtime error: {type(exc).__name__}", file=sys.stderr)
                 time.sleep(2)
     except KeyboardInterrupt:
         return 0

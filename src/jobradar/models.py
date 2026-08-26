@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import html
+import re
 from typing import Any
+
+
+def _plain_html(value: str) -> str:
+    without_tags = re.sub(r"<[^>]+>", " ", value or "")
+    return re.sub(r"\s+", " ", html.unescape(without_tags)).strip()
 
 
 @dataclass(frozen=True)
@@ -29,6 +36,10 @@ class Vacancy:
         text = " ".join(
             part for part in [snippet.get("requirement") or "", snippet.get("responsibility") or ""] if part
         )
+        if item.get("description"):
+            full_description = _plain_html(str(item.get("description") or ""))
+            if full_description:
+                text = full_description
         roles = tuple(
             role.get("name", "")
             for role in (item.get("professional_roles") or [])

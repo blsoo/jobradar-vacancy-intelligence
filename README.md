@@ -31,6 +31,8 @@ The current code can:
 - build cover letters only from evidence already present in the portfolio profile;
 - keep applications, employer events, invitations, rejections, interviews and reminders as persistent entities;
 - use the current HH chat API after applicant OAuth is configured;
+- activate applicant OAuth through `/hh_auth` without storing the user's HH login/password;
+- persist access/refresh tokens only in the protected runtime DB and refresh them after access-token expiry;
 - detect new employer messages once and avoid duplicate notifications;
 - classify clear invitations/interview messages and clear rejections;
 - extract explicit interview date/time from Russian messages (`29.08 15:30`, `29 августа в 15:30`, `завтра в 12:00`);
@@ -75,6 +77,21 @@ Junior System Analyst · Company
 
 If the employer message is positive but contains no reliable date/time, the response is still stored and notified; JobRadar does **not** invent a meeting time.
 
+## One-time HH authorization
+
+The runtime never asks for or stores the applicant's HeadHunter password.
+
+After an HH API application is configured with `HH_CLIENT_ID` and `HH_CLIENT_SECRET`:
+
+1. send `/hh_status` to check the integration state;
+2. send `/hh_auth` and open the generated official HH authorization link;
+3. approve access on hh.ru;
+4. copy the complete redirect URL and send `/hhcode <redirect URL>` back to the owner-only bot;
+5. JobRadar validates OAuth `state`, exchanges the one-time code, verifies that the token belongs to an applicant, then stores the token pair only in the private runtime database;
+6. the Telegram message containing the one-time authorization code is deleted on a best-effort basis.
+
+The refresh token is rotated only after the current access token expires, following HH's token lifecycle rules.
+
 ## Persistence model
 
 SQLite keeps separate records for:
@@ -84,7 +101,8 @@ SQLite keeps separate records for:
 - employer messages/events;
 - scheduled interviews;
 - reminder deliveries;
-- runtime cursors for Telegram and HH chats.
+- runtime cursors for Telegram and HH chats;
+- the private OAuth token pair after the user completes authorization.
 
 Repeated polling or worker restarts therefore do not create duplicate invitations or duplicate reminders.
 
@@ -104,7 +122,7 @@ Search and Telegram control are intentionally separated:
 
 Vacancy discovery can work without applicant OAuth. Reading personal HH chats, invitations and responses cannot: HeadHunter requires OAuth2 for those endpoints.
 
-`HH_OAUTH_TOKEN` is therefore a runtime secret. It is never committed. When absent, the vacancy radar and Telegram workflow continue to work, while the applicant inbox monitor stays disabled rather than failing open.
+Only the HH application's client credentials are injected into the private runtime environment. User access/refresh tokens obtained by `/hh_auth` stay in the protected VPS database and are never committed to the public repository.
 
 The project uses the current `/common/chats` API for employer messages. Platform-side automatic application submission remains a separate mutation boundary and must only be marked successful after HH confirms it.
 
@@ -148,7 +166,9 @@ Important values:
 - `JOBRADAR_TARGET_SALARY_RUB` — salary preference signal;
 - `JOBRADAR_TIMEZONE` — timezone used for interview parsing and reminders;
 - `JOBRADAR_INBOX_POLL_SECONDS` — employer inbox check cadence;
-- `HH_OAUTH_TOKEN` — applicant OAuth token enabling personal HH chat tracking;
+- `HH_CLIENT_ID` / `HH_CLIENT_SECRET` — HH API application credentials kept only in runtime secrets;
+- `HH_REDIRECT_URI` — redirect URI registered for the HH API application;
+- `HH_OAUTH_TOKEN` — optional bootstrap token; normal user authorization uses `/hh_auth`;
 - `HH_SEARCH_QUERIES` and `HH_AREA` — discovery scope.
 
 ## Core invariants
@@ -162,14 +182,16 @@ Important values:
 7. OAuth-only features fail closed when OAuth is absent;
 8. discovery frequency does not imply notification frequency;
 9. interview times are stored only when a date/time can be extracted from employer evidence;
-10. reminders are marked sent only after Telegram accepts the notification.
+10. reminders are marked sent only after Telegram accepts the notification;
+11. HH login/password is never collected by JobRadar;
+12. OAuth authorization code/state and refresh rotation are handled as security boundaries.
 
 ## Roadmap
 
-- [#1 HH applicant OAuth and safe application adapter](https://github.com/blsoo/jobradar-vacancy-intelligence/issues/1)
+- [#1 Complete HH applicant OAuth and safe application adapter](https://github.com/blsoo/jobradar-vacancy-intelligence/issues/1)
 - [#2 PostgreSQL repository and migrations](https://github.com/blsoo/jobradar-vacancy-intelligence/issues/2)
 - [#3 Multi-source adapters and feedback-aware ranking](https://github.com/blsoo/jobradar-vacancy-intelligence/issues/3)
 
 ## Portfolio value
 
-The repository now demonstrates vacancy discovery, explainable ranking, career-fit reasoning, persistent application-state modelling, personal inbox integration, event deduplication, date extraction, reminder scheduling, Telegram UX, tests and CI without pretending that an OAuth-disabled feature is already active.
+The repository now demonstrates vacancy discovery, explainable ranking, career-fit reasoning, persistent application-state modelling, OAuth lifecycle design, personal inbox integration, event deduplication, date extraction, reminder scheduling, Telegram UX, tests and CI without pretending that an OAuth-disabled feature is already active.

@@ -40,6 +40,8 @@ class Settings:
     hh_user_agent: str
     hh_oauth_token: str
     hh_resume_id: str
+    timezone: str = "Europe/Moscow"
+    inbox_poll_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,8 +68,10 @@ class Settings:
             hh_per_page=int(os.getenv("HH_PER_PAGE", "50")),
             hh_user_agent=os.getenv(
                 "HH_USER_AGENT",
-                "JobRadar/0.1 (317558701+blsoo@users.noreply.github.com)",
+                "JobRadar/0.2 (317558701+blsoo@users.noreply.github.com)",
             ),
             hh_oauth_token=os.getenv("HH_OAUTH_TOKEN", "").strip(),
             hh_resume_id=os.getenv("HH_RESUME_ID", "").strip(),
+            timezone=os.getenv("JOBRADAR_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow",
+            inbox_poll_seconds=max(60, int(os.getenv("JOBRADAR_INBOX_POLL_SECONDS", "60"))),
         )

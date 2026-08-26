@@ -1,32 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
 import html
 import json
 from urllib.request import Request, urlopen
 
+from .career_fit import evaluate_career_fit
 from .models import RankedVacancy
-
-
-MATCH_LABELS = {
-    "system analysis": "системный анализ",
-    "internship": "стажировка",
-    "junior": "junior",
-    "SQL": "SQL",
-    "REST": "REST",
-    "HTTP": "HTTP",
-    "JSON": "JSON",
-    "API": "API",
-    "Swagger/OpenAPI": "Swagger/OpenAPI",
-    "requirements": "требования",
-    "UML": "UML",
-    "BPMN": "BPMN",
-    "integrations": "интеграции",
-    "PostgreSQL": "PostgreSQL",
-    "Git": "Git",
-    "core junior analyst match": "прямое попадание в junior SA",
-    "remote": "удалёнка",
-    "no experience required": "без опыта",
-}
 
 
 class TelegramClient:
@@ -80,31 +60,7 @@ class TelegramClient:
         prefix = "от" if v.salary_from is not None else "до"
         return f"{prefix} {value:,} {cur}".replace(",", " ")
 
-    @staticmethod
-    def _screening_label(score: int) -> str:
-        if score >= 88:
-            return "очень высокая"
-        if score >= 78:
-            return "высокая"
-        if score >= 68:
-            return "выше средней"
-        return "средняя"
-
-    @staticmethod
-    def _strengths(item: RankedVacancy) -> str:
-        strengths: list[str] = []
-        for raw in item.score.matched:
-            if raw.startswith("salary ≥"):
-                label = "зарплата от твоей цели"
-            else:
-                label = MATCH_LABELS.get(raw, raw)
-            if label not in strengths:
-                strengths.append(label)
-            if len(strengths) >= 4:
-                break
-        return " · ".join(strengths) or "есть совпадение с junior-профилем"
-
-    def send_digest(self, items: list[RankedVacancy]) -> None:
+    def send_digest(self, items: list[RankedVacancy], *, target_salary_rub: int = 70_000) -> None:
         if not items:
             return
         items = items[:3]
@@ -116,23 +72,25 @@ class TelegramClient:
             if item.local_id is None:
                 raise ValueError("local_id is required for Telegram callbacks")
             v = item.vacancy
+            fit = evaluate_career_fit(item, target_salary_rub=target_salary_rub)
             mark = number_marks[index]
             title = html.escape(v.title)
             company = html.escape(v.company or "компания не указана")
             area = html.escape(v.area or "локация не указана")
-            schedule = html.escape(v.schedule or "формат не указан")
             salary = html.escape(self._salary_text(item))
-            screening = self._screening_label(item.score.total)
-            strengths = html.escape(self._strengths(item))
             url = html.escape(v.url or v.application_url, quote=True)
+            work = html.escape(" · ".join(fit.work_with[:4]) or "задачи стоит уточнить")
+            advantages = html.escape(" · ".join(fit.advantages[:4]) or "есть совпадение с целевым профилем")
 
             chunks.append(
                 "\n"
                 f"{mark} <a href=\"{url}\"><b>{title}</b></a>\n"
                 f"{company} · {area}\n"
-                f"💰 {salary} · 🏠 {schedule}\n"
-                f"📈 Шанс первичного скрининга: <b>{screening}</b> · {item.score.total}/100\n"
-                f"✅ {strengths}"
+                f"💰 <b>{salary}</b>\n"
+                f"🎯 Скрининг: <b>{fit.screening_label}</b> · {item.score.total}/100\n"
+                f"❤️ Тебе должно зайти: <b>{fit.interest_label}</b> · {fit.interest_score}/100\n"
+                f"🛠 {work}\n"
+                f"✅ {advantages}"
             )
             keyboard.append(
                 [
@@ -142,7 +100,9 @@ class TelegramClient:
                 ]
             )
 
-        chunks.append("\n<i>Шанс скрининга — эвристическая оценка JobRadar по совпадению требований с текущим профилем, не статистическая гарантия оффера.</i>")
+        chunks.append(
+            "\n<i>Оценки — объяснимая эвристика по требованиям вакансии и целевому профилю, а не обещание оффера.</i>"
+        )
         self._call(
             "sendMessage",
             {
@@ -156,6 +116,68 @@ class TelegramClient:
 
     def send_vacancy(self, item: RankedVacancy) -> None:
         self.send_digest([item])
+
+    def send_positive_response(
+        self,
+        item: RankedVacancy | None,
+        *,
+        sender_name: str,
+        message_text: str,
+        interview_at: datetime | None = None,
+        target_salary_rub: int = 70_000,
+    ) -> None:
+        if item is None:
+            text = f"🎉 Положительный ответ от работодателя\n{sender_name}\n\n{message_text[:900]}"
+            self.send_text(text)
+            return
+        fit = evaluate_career_fit(item, target_salary_rub=target_salary_rub)
+        work = " · ".join(fit.work_with[:5]) or "задачи стоит уточнить"
+        advantages = " · ".join(fit.advantages[:5]) or "есть совпадение с целевым профилем"
+        lines = [
+            "🎉 ПОЛОЖИТЕЛЬНЫЙ ОТВЕТ",
+            f"{item.vacancy.title} · {item.vacancy.company}",
+            f"💰 {self._salary_text(item)}",
+            f"🎯 Скрининг: {fit.screening_label} · {item.score.total}/100",
+            f"❤️ Насколько тебе подходит: {fit.interest_label} · {fit.interest_score}/100",
+            f"🛠 С чем работать: {work}",
+            f"✅ Почему интересно: {advantages}",
+        ]
+        if interview_at is not None:
+            lines.append(f"📅 Собеседование: {interview_at.strftime('%d.%m.%Y %H:%M %Z')}")
+            lines.append("⏰ Напоминания: за 24 часа, 2 часа и 30 минут")
+        lines.extend(["", f"Сообщение: {message_text[:800]}"])
+        self.send_text("\n".join(lines))
+
+    def send_employer_message(self, item: RankedVacancy | None, sender_name: str, message_text: str) -> None:
+        title = item.vacancy.title if item else "вакансия"
+        company = item.vacancy.company if item else sender_name
+        self.send_text(f"💬 Ответ работодателя\n{title} · {company}\n\n{message_text[:1000]}")
+
+    def send_rejection(self, item: RankedVacancy | None, sender_name: str, message_text: str) -> None:
+        title = item.vacancy.title if item else "вакансия"
+        company = item.vacancy.company if item else sender_name
+        self.send_text(f"📭 Ответ по отклику\n{title} · {company}\nСтатус: отказ\n\n{message_text[:700]}")
+
+    def send_interview_reminder(
+        self,
+        *,
+        title: str,
+        company: str,
+        scheduled_at: datetime,
+        kind: str,
+    ) -> None:
+        labels = {
+            "day_before": "завтра",
+            "two_hours": "через 2 часа",
+            "thirty_minutes": "через 30 минут",
+        }
+        when = labels.get(kind, "скоро")
+        self.send_text(
+            "⏰ СОБЕС " + when + "\n"
+            f"{title or 'Вакансия'} · {company or 'Компания'}\n"
+            f"📅 {scheduled_at.strftime('%d.%m.%Y %H:%M %Z')}\n\n"
+            "Проверь ссылку/контакт, перечитай вакансию и подготовь 3–5 вопросов работодателю."
+        )
 
     def send_text(self, text: str, *, reply_markup: dict | None = None, chat_id: str | None = None) -> None:
         payload = {"chat_id": self._target(chat_id), "text": text, "disable_web_page_preview": True}

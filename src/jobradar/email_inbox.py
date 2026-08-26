@@ -6,21 +6,58 @@ from email import message_from_bytes
 from email.header import decode_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
+from html import unescape
 import imaplib
 import re
 
 
 VACANCY_ID_RE = re.compile(r"(?:hh\.ru|headhunter\.ru)/vacancy/(\d+)", re.IGNORECASE)
 HH_HINTS = ("hh.ru", "headhunter", "hh mail", "hh робот")
-RECRUITING_HINTS = (
-    "ваканси",
-    "отклик",
-    "резюме",
+DIRECT_EMPLOYER_HINTS = (
+    "работодатель",
+    "ответ работодателя",
+    "сообщение от работодателя",
+    "новое сообщение",
+    "приглаш",
     "собеседован",
     "интервью",
-    "приглаш",
-    "работодатель",
+    "созвон",
+    "встреч",
+    "отказ",
+    "другого кандидата",
+    "не готовы продолжить",
+    "готовы продолжить",
+    "следующий этап",
+    "технический этап",
 )
+SYSTEM_HH_SUBJECT_HINTS = (
+    "резюме прошло модерацию",
+    "резюме опубликовано",
+    "резюме обновлено",
+    "резюме проверено",
+    "резюме успешно создано",
+    "резюме заблокировано",
+    "модерац",
+    "статистика резюме",
+    "просмотры резюме",
+    "поднимите резюме",
+    "автоподнятие резюме",
+    "рекомендованные вакансии",
+    "вакансии для вас",
+    "подборка вакансий",
+    "подтвердите почту",
+    "изменение пароля",
+)
+
+_HTML_DROP_BLOCKS_RE = re.compile(
+    r"<(style|script|head)\b[^>]*>.*?</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_BREAKS_RE = re.compile(
+    r"</?(?:br|p|div|section|article|tr|td|li|ul|ol|h[1-6])\b[^>]*>",
+    re.IGNORECASE,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 @dataclass(frozen=True)
@@ -67,9 +104,30 @@ def _part_text(part: Message) -> str:
         return payload.decode("utf-8", errors="replace")
 
 
+def _clean_html(raw: str) -> str:
+    cleaned = _HTML_DROP_BLOCKS_RE.sub(" ", raw)
+    cleaned = re.sub(r"<!--.*?-->", " ", cleaned, flags=re.DOTALL)
+    cleaned = _HTML_BREAKS_RE.sub("\n", cleaned)
+    cleaned = _HTML_TAG_RE.sub(" ", cleaned)
+    cleaned = unescape(cleaned)
+    cleaned = cleaned.replace("\xa0", " ")
+    cleaned = re.sub(r"[ \t\r\f\v]+", " ", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_plain(raw: str) -> str:
+    cleaned = unescape(raw).replace("\xa0", " ")
+    cleaned = re.sub(r"[ \t\r\f\v]+", " ", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _message_text(message: Message) -> str:
     plain: list[str] = []
-    html: list[str] = []
+    html_parts: list[str] = []
     if message.is_multipart():
         for part in message.walk():
             if part.get_content_disposition() == "attachment":
@@ -78,17 +136,16 @@ def _message_text(message: Message) -> str:
             if content_type == "text/plain":
                 plain.append(_part_text(part))
             elif content_type == "text/html":
-                html.append(_part_text(part))
+                html_parts.append(_part_text(part))
     else:
         if message.get_content_type() == "text/html":
-            html.append(_part_text(message))
+            html_parts.append(_part_text(message))
         else:
             plain.append(_part_text(message))
-    raw = "\n".join(plain or html)
-    raw = re.sub(r"<[^>]+>", " ", raw)
-    raw = re.sub(r"[ \t\r\f\v]+", " ", raw)
-    raw = re.sub(r"\n{3,}", "\n\n", raw)
-    return raw.strip()
+
+    if plain:
+        return _normalize_plain("\n".join(plain))
+    return _clean_html("\n".join(html_parts))
 
 
 def _received_at(message: Message) -> str:
@@ -122,10 +179,19 @@ def parse_email(uid: int, raw: bytes) -> EmailEmployerMessage:
 
 
 def is_hh_recruiting_message(message: EmailEmployerMessage) -> bool:
-    haystack = f"{message.sender}\n{message.subject}\n{message.text}".lower()
-    from_hh = any(hint in message.sender.lower() for hint in HH_HINTS)
-    recruiting = any(hint in haystack for hint in RECRUITING_HINTS)
-    return bool((from_hh and recruiting) or (message.vacancy_id and recruiting))
+    sender = message.sender.lower().replace("ё", "е")
+    subject = message.subject.lower().replace("ё", "е")
+    haystack = f"{message.sender}\n{message.subject}\n{message.text}".lower().replace("ё", "е")
+    from_hh = any(hint in sender for hint in HH_HINTS)
+
+    if from_hh and any(hint in subject for hint in SYSTEM_HH_SUBJECT_HINTS):
+        return False
+
+    direct_response = any(hint in haystack for hint in DIRECT_EMPLOYER_HINTS)
+    if not direct_response:
+        return False
+
+    return bool(from_hh or message.vacancy_id)
 
 
 class IMAPInboxClient:

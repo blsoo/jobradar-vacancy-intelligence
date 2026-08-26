@@ -42,6 +42,9 @@ class Settings:
     hh_resume_id: str
     timezone: str = "Europe/Moscow"
     inbox_poll_seconds: int = 60
+    hh_client_id: str = ""
+    hh_client_secret: str = ""
+    hh_redirect_uri: str = "https://github.com/blsoo/jobradar-vacancy-intelligence"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -74,4 +77,10 @@ class Settings:
             hh_resume_id=os.getenv("HH_RESUME_ID", "").strip(),
             timezone=os.getenv("JOBRADAR_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow",
             inbox_poll_seconds=max(60, int(os.getenv("JOBRADAR_INBOX_POLL_SECONDS", "60"))),
+            hh_client_id=os.getenv("HH_CLIENT_ID", "").strip(),
+            hh_client_secret=os.getenv("HH_CLIENT_SECRET", "").strip(),
+            hh_redirect_uri=os.getenv(
+                "HH_REDIRECT_URI",
+                "https://github.com/blsoo/jobradar-vacancy-intelligence",
+            ).strip(),
         )

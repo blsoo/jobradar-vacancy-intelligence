@@ -2,64 +2,91 @@
 
 [![JobRadar checks](https://github.com/blsoo/jobradar-vacancy-intelligence/actions/workflows/ci.yml/badge.svg)](https://github.com/blsoo/jobradar-vacancy-intelligence/actions/workflows/ci.yml)
 
-**Vacancy intelligence · HH discovery · explainable scoring · Telegram actions · SQLite**
+**Vacancy intelligence · HH discovery · applicant inbox tracking · career fit · interview reminders · Telegram**
 
-JobRadar turns a noisy vacancy feed into a small ranked queue of opportunities worth reviewing.
+JobRadar turns a noisy vacancy feed into a small ranked queue and then keeps the application funnel in one place.
 
 ```text
 HH discovery
-    -> normalize
-    -> deterministic score
-    -> deduplicate
-    -> SQLite state
+    -> explainable ranking
     -> quiet top-3 Telegram digest
     -> apply / save / skip
     -> application funnel
+    -> HH employer chat monitor (OAuth)
+    -> positive response / rejection
+    -> interview date detection
+    -> reminders: 24h / 2h / 30m
 ```
 
-## Working MVP
+## Working behaviour
 
 The current code can:
 
 - discover HeadHunter vacancies through the API when authorized and use HH public RSS as the anonymous fallback;
 - rank them for a Junior System Analyst / Integration profile;
-- reward SQL, REST, HTTP, JSON, API, requirements, UML/BPMN, integrations, junior/no-experience signals, salary target and remote work;
-- penalize clearly senior/lead roles;
-- deduplicate by `(source, external_id)` and store state in SQLite;
-- bind one owner Telegram chat on the first `/start`;
-- send only vacancies above the configured quality threshold;
-- combine up to three best new vacancies into one Telegram digest;
-- rate-limit unsolicited vacancy digests to at most one per 30 minutes;
-- show salary, format, a profile-match score and a human-readable screening-chance band;
+- deduplicate vacancies and keep state in SQLite;
+- send one quiet digest with at most three high-score vacancies, no more than once per 30 minutes;
 - expose exactly three first-level actions per vacancy: `Apply`, `Save`, `Skip`;
-- generate a short cover letter only from portfolio evidence actually matched to the vacancy;
-- keep repeated callbacks idempotent;
-- keep application state fail-closed instead of pretending HH accepted a response when it did not.
+- show salary, screening-fit band, personal interest-fit score and a short explanation of what the job actually involves;
+- build cover letters only from evidence already present in the portfolio profile;
+- keep applications, employer events, invitations, rejections, interviews and reminders as persistent entities;
+- use the current HH chat API after applicant OAuth is configured;
+- detect new employer messages once and avoid duplicate notifications;
+- classify clear invitations/interview messages and clear rejections;
+- extract explicit interview date/time from Russian messages (`29.08 15:30`, `29 августа в 15:30`, `завтра в 12:00`);
+- schedule Telegram reminders for 24 hours, 2 hours and 30 minutes before a detected interview;
+- show a fresh career-fit summary again when an invitation arrives: salary, likely day-to-day work, fit for the target direction and screening match;
+- expose the accumulated funnel through `/stats`.
 
-## Telegram flow
+## Vacancy Telegram flow
 
 ```text
 🎯 JobRadar · лучшие новые вакансии
 
 1️⃣ Junior System Analyst
 Company · Москва
-💰 70 000–90 000 ₽ · 🏠 Удалённо
-📈 Шанс первичного скрининга: высокий · 86/100
-✅ SQL · REST · требования · без опыта
-
-2️⃣ ...
-3️⃣ ...
+💰 70 000–90 000 ₽
+🎯 Скрининг: высокий · 86/100
+❤️ Тебе должно зайти: скорее должно зайти · 82/100
+🛠 требования · REST API и интеграции · SQL и данные
+✅ целевая роль · junior · удалённый формат
 
 [1 🔥 Отклик] [1 📌 Сохранить] [1 ❌ Мимо]
 [2 🔥 Отклик] [2 📌 Сохранить] [2 ❌ Мимо]
 [3 🔥 Отклик] [3 📌 Сохранить] [3 ❌ Мимо]
 ```
 
-The screening label is an **explainable heuristic**, not an empirical probability of receiving an offer. It reflects how strongly the vacancy matches the configured junior profile and known portfolio evidence.
+The scores are explainable heuristics, not fabricated probabilities of an offer. They are intended to answer two separate questions: **how well the vacancy matches the current profile** and **how likely the day-to-day work is to fit the chosen career direction**.
 
-`🔥 Отклик` stores `apply_requested`, prepares a truthful cover letter and provides the HH application page. Until an official applicant OAuth adapter confirms a platform-side response, JobRadar does not claim that an application was sent.
+## Positive response flow
 
-`📌 Сохранить` and `❌ Мимо` are one-tap actions and do not create extra chat messages.
+With applicant OAuth enabled, JobRadar checks HH employer chats every minute. A clear interview/invitation message becomes a persistent employer event and produces a Telegram notification such as:
+
+```text
+🎉 ПОЛОЖИТЕЛЬНЫЙ ОТВЕТ
+Junior System Analyst · Company
+💰 80 000 ₽
+🎯 Скрининг: высокий · 84/100
+❤️ Насколько тебе подходит: скорее должно зайти · 81/100
+🛠 С чем работать: требования · API · SQL · интеграции
+📅 Собеседование: 29.08.2026 15:30 MSK
+⏰ Напоминания: за 24 часа, 2 часа и 30 минут
+```
+
+If the employer message is positive but contains no reliable date/time, the response is still stored and notified; JobRadar does **not** invent a meeting time.
+
+## Persistence model
+
+SQLite keeps separate records for:
+
+- vacancies and Telegram decisions;
+- applications;
+- employer messages/events;
+- scheduled interviews;
+- reminder deliveries;
+- runtime cursors for Telegram and HH chats.
+
+Repeated polling or worker restarts therefore do not create duplicate invitations or duplicate reminders.
 
 ## Anti-spam behaviour
 
@@ -69,12 +96,17 @@ Search and Telegram control are intentionally separated:
 - low-score vacancies stay silent;
 - old backlog is not drained into Telegram;
 - at most three opportunities are shown in one digest;
-- unsolicited digests have a 30-minute cooldown;
+- unsolicited vacancy digests have a 30-minute cooldown;
+- employer responses and interview reminders are event notifications and bypass the vacancy-digest cooldown;
 - button callbacks and `/stats` can still be processed every minute.
 
-## First-run Telegram binding
+## HH OAuth boundary
 
-`TELEGRAM_CHAT_ID` is optional. If empty, the first `/start` claims the bot and persists the owner chat ID. Other chats cannot mutate JobRadar state after binding.
+Vacancy discovery can work without applicant OAuth. Reading personal HH chats, invitations and responses cannot: HeadHunter requires OAuth2 for those endpoints.
+
+`HH_OAUTH_TOKEN` is therefore a runtime secret. It is never committed. When absent, the vacancy radar and Telegram workflow continue to work, while the applicant inbox monitor stays disabled rather than failing open.
+
+The project uses the current `/common/chats` API for employer messages. Platform-side automatic application submission remains a separate mutation boundary and must only be marked successful after HH confirms it.
 
 ## Run
 
@@ -111,26 +143,26 @@ Important values:
 
 - `TELEGRAM_BOT_TOKEN` — Telegram secret, never committed;
 - `TELEGRAM_CHAT_ID` — optional fixed owner chat;
-- `JOBRADAR_SCORE_THRESHOLD` — minimum score for Telegram delivery, default `70`;
+- `JOBRADAR_SCORE_THRESHOLD` — minimum vacancy score for Telegram delivery, default `70`;
 - `JOBRADAR_MAX_PUSH_PER_CYCLE` — hard cap per digest, default `3`;
 - `JOBRADAR_TARGET_SALARY_RUB` — salary preference signal;
-- `HH_SEARCH_QUERIES` — semicolon-separated search phrases;
-- `HH_AREA` — HH area ID.
+- `JOBRADAR_TIMEZONE` — timezone used for interview parsing and reminders;
+- `JOBRADAR_INBOX_POLL_SECONDS` — employer inbox check cadence;
+- `HH_OAUTH_TOKEN` — applicant OAuth token enabling personal HH chat tracking;
+- `HH_SEARCH_QUERIES` and `HH_AREA` — discovery scope.
 
-## Architecture
-
-See [ARCHITECTURE.md](ARCHITECTURE.md).
-
-Core invariants:
+## Core invariants
 
 1. vacancy identity is stable by `(source, external_id)`;
 2. delivery is marked only after a successful Telegram send;
-3. repeated identical decisions are idempotent;
+3. repeated identical decisions and employer events are idempotent;
 4. owner chat binding is persistent;
 5. scoring remains explainable;
 6. `applied` never means merely "an attempt was made";
-7. external OAuth mutations fail closed;
-8. discovery frequency must not imply notification frequency.
+7. OAuth-only features fail closed when OAuth is absent;
+8. discovery frequency does not imply notification frequency;
+9. interview times are stored only when a date/time can be extracted from employer evidence;
+10. reminders are marked sent only after Telegram accepts the notification.
 
 ## Roadmap
 
@@ -140,4 +172,4 @@ Core invariants:
 
 ## Portfolio value
 
-The repository demonstrates external integration, normalization, deterministic ranking, persistence, deduplication, idempotent Telegram callbacks, rate-limited notifications, application-state modelling, tests and CI without presenting a design prototype as production automation.
+The repository now demonstrates vacancy discovery, explainable ranking, career-fit reasoning, persistent application-state modelling, personal inbox integration, event deduplication, date extraction, reminder scheduling, Telegram UX, tests and CI without pretending that an OAuth-disabled feature is already active.

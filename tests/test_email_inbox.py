@@ -4,6 +4,7 @@ from email.header import Header
 import unittest
 
 from jobradar.email_inbox import is_hh_recruiting_message, parse_email
+from jobradar.hh_inbox import classify_employer_message
 
 
 class EmailInboxTests(unittest.TestCase):
@@ -21,6 +22,7 @@ class EmailInboxTests(unittest.TestCase):
         self.assertEqual(msg.vacancy_id, "123456")
         self.assertIn("собеседование", msg.text)
         self.assertTrue(is_hh_recruiting_message(msg))
+        self.assertEqual(classify_employer_message(msg.combined_text), "positive")
 
     def test_rejects_hh_resume_moderation_and_strips_css(self) -> None:
         subject = Header("Ваше резюме прошло модерацию", "utf-8").encode()
@@ -66,6 +68,58 @@ class EmailInboxTests(unittest.TestCase):
         ).encode("utf-8")
         msg = parse_email(44, raw)
         self.assertTrue(is_hh_recruiting_message(msg))
+        self.assertEqual(classify_employer_message(msg.combined_text), "message")
+
+    def test_hh_rejection_is_not_positive_and_boilerplate_is_trimmed(self) -> None:
+        subject = Header("Работодатель не готов пригласить вас", "utf-8").encode()
+        html = """
+        <html>
+          <head><style>.mj-column-per-100 { width:100% !important; }</style></head>
+          <body>
+            <p>Работодатель не готов пригласить вас</p>
+            <p>Вы можете подобрать другие вакансии</p>
+            <div>\u200b\u200c\u2800\u2800\u2800</div>
+            <p>Работодатель не готов</p>
+            <p>пригласить вас</p>
+            <p>Вакансия: Аналитик/программист-стажёр 1С</p>
+            <p>Компания: Сигма. Автоматизация бизнеса</p>
+            <a href="https://hh.ru/vacancy/136588752">Посмотреть вакансию можно по этой ссылке →</a>
+            <p>Выбрать другую вакансию</p>
+            <p>Если нужна помощь</p>
+            <p>Написать в поддержку</p>
+            <p>Управлять рассылкой</p>
+            <p>Вы получили это письмо, поскольку зарегистрированы на hh.ru</p>
+          </body>
+        </html>
+        """
+        raw = (
+            "From: hh.ru <noreply@hh.ru>\r\n"
+            f"Subject: {subject}\r\n"
+            "Message-ID: <hh-rejection-136588752@example>\r\n"
+            "Date: Thu, 27 Aug 2026 09:30:00 +0300\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n\r\n"
+            + html
+        ).encode("utf-8")
+
+        msg = parse_email(45, raw)
+        self.assertTrue(is_hh_recruiting_message(msg))
+        self.assertEqual(msg.vacancy_id, "136588752")
+        self.assertEqual(classify_employer_message(msg.combined_text), "rejection")
+        self.assertNotIn("mj-column", msg.text)
+        self.assertNotIn("\u2800", msg.text)
+        self.assertNotIn("Выбрать другую вакансию", msg.text)
+        self.assertNotIn("Написать в поддержку", msg.text)
+        self.assertNotIn("Вы получили это письмо", msg.text)
+
+    def test_negative_invite_beats_positive_substring(self) -> None:
+        self.assertEqual(
+            classify_employer_message("Работодатель не готов пригласить вас"),
+            "rejection",
+        )
+        self.assertEqual(
+            classify_employer_message("Работодатель приглашает вас на интервью"),
+            "positive",
+        )
 
     def test_rejects_unrelated_mail(self) -> None:
         raw = (

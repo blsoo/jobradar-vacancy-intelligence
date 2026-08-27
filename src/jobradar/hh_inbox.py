@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -108,9 +109,31 @@ class HHInboxClient:
         return found
 
 
+def _normalize_message(text: str) -> str:
+    value = (text or "").lower().replace("ё", "е")
+    value = re.sub(r"[\u00ad\u034f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u2800]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
 def classify_employer_message(text: str) -> str:
-    lower = (text or "").lower().replace("ё", "е")
-    rejection = ("отказ", "не готовы", "другого кандидата", "не сможем продолжить", "не готовы продолжить")
+    lower = _normalize_message(text)
+
+    rejection_markers = (
+        "отказ",
+        "другого кандидата",
+        "не сможем продолжить",
+        "не готовы продолжить",
+        "не готов продолжить",
+        "не готова продолжить",
+        "не можем продолжить",
+        "не приглашаем",
+        "не можем пригласить",
+    )
+    negative_invite = re.search(r"\bне\s+(?:готов(?:а|ы)?\s+)?приглас(?:ить|им|ить вас)\b", lower)
+    if negative_invite or any(marker in lower for marker in rejection_markers):
+        return "rejection"
+
     positive = (
         "приглашаем",
         "пригласить",
@@ -120,11 +143,11 @@ def classify_employer_message(text: str) -> str:
         "встреч",
         "хотели бы пообщаться",
         "готовы продолжить",
+        "готов продолжить",
+        "готова продолжить",
         "следующий этап",
         "технический этап",
     )
-    if any(marker in lower for marker in rejection):
-        return "rejection"
     if any(marker in lower for marker in positive):
         return "positive"
     return "message"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
+import re
 import sqlite3
 
 from .config import Settings
@@ -108,6 +109,53 @@ def _refresh_vacancy(settings: Settings, store: VacancyStore, vacancy_id: str) -
         return store.get_by_external_id("hh", vacancy_id)
 
 
+def _rejection_display_text(text: str) -> str:
+    normalized = (text or "").lower().replace("ё", "е")
+    normalized = re.sub(r"\s+", " ", normalized)
+    if re.search(r"\bне\s+(?:готов(?:а|ы)?\s+)?приглас", normalized):
+        return "Работодатель не готов пригласить вас."
+    if "другого кандидата" in normalized:
+        return "Работодатель выбрал другого кандидата."
+    if any(marker in normalized for marker in ("не готовы продолжить", "не готов продолжить", "не сможем продолжить", "не можем продолжить")):
+        return "Работодатель не готов продолжить процесс."
+    return "Работодатель отказал по отклику."
+
+
+def _repair_legacy_rejection_events(store: VacancyStore) -> int:
+    """Repair older events that were marked positive because 'не готов пригласить'
+    contained the positive substring 'пригласить'. Only rows that the current
+    classifier now deterministically calls a rejection are changed.
+    """
+    rows = store.conn.execute(
+        "SELECT id, application_id, text FROM employer_events WHERE event_type='positive'"
+    ).fetchall()
+    repaired = 0
+    for row in rows:
+        if classify_employer_message(str(row["text"] or "")) != "rejection":
+            continue
+        event_id = int(row["id"])
+        application_id = int(row["application_id"])
+        store.conn.execute("UPDATE employer_events SET event_type='rejection' WHERE id=?", (event_id,))
+        latest = store.conn.execute(
+            """
+            SELECT id FROM employer_events
+            WHERE application_id=?
+            ORDER BY COALESCE(event_at, created_at) DESC, id DESC
+            LIMIT 1
+            """,
+            (application_id,),
+        ).fetchone()
+        if latest and int(latest["id"]) == event_id:
+            store.conn.execute(
+                "UPDATE applications SET status='rejected', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (application_id,),
+            )
+        repaired += 1
+    if repaired:
+        store.conn.commit()
+    return repaired
+
+
 def process_message(
     settings: Settings,
     store: VacancyStore,
@@ -149,7 +197,11 @@ def process_message(
             target_salary_rub=settings.target_salary_rub,
         )
     elif event_type == "rejection":
-        telegram.send_rejection(item, message.sender or "Работодатель", message.combined_text)
+        telegram.send_rejection(
+            item,
+            message.sender or "Работодатель",
+            _rejection_display_text(message.combined_text),
+        )
     else:
         telegram.send_employer_message(item, message.sender or "Работодатель", message.combined_text)
 
@@ -173,6 +225,10 @@ def run(settings: Settings | None = None) -> int:
         mailbox=settings.email_imap_mailbox,
     )
     try:
+        repaired = _repair_legacy_rejection_events(store)
+        if repaired:
+            print(f"JobRadar email: repaired_rejections={repaired}")
+
         raw_cursor = store.get_setting("email_last_uid")
         if raw_cursor is None:
             latest = client.latest_uid()

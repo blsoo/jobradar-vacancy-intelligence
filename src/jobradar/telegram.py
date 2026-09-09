@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import html
 import json
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .career_fit import evaluate_career_fit
@@ -15,6 +16,7 @@ class TelegramClient:
         self.token = token
         self.chat_id = chat_id
         self.timeout = timeout
+        self._polling_prepared = False
 
     @property
     def enabled(self) -> bool:
@@ -37,10 +39,21 @@ class TelegramClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(request, timeout=self.timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            description = f"HTTP {exc.code}"
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8", errors="replace"))
+                description = str(error_payload.get("description") or description)
+            except Exception:
+                pass
+            # Never include the request URL here: it contains the bot token.
+            raise RuntimeError(f"Telegram API {method} failed: {description}") from None
         if not result.get("ok"):
-            raise RuntimeError(f"Telegram API error: {result}")
+            description = str(result.get("description") or "unknown Telegram error")
+            raise RuntimeError(f"Telegram API {method} failed: {description}")
         return result
 
     def _target(self, chat_id: str | None = None) -> str:
@@ -201,9 +214,23 @@ class TelegramClient:
     def delete_message(self, chat_id: str, message_id: int) -> None:
         self._call("deleteMessage", {"chat_id": str(chat_id), "message_id": int(message_id)})
 
+    def prepare_polling(self) -> None:
+        """Ensure long polling owns the bot update stream.
+
+        Telegram refuses getUpdates while a webhook is configured. JobRadar is a
+        long-polling bot, so an old webhook left behind by a previous deployment
+        must not silently disable callback buttons. deleteWebhook is idempotent
+        and does not drop queued updates here.
+        """
+        if self._polling_prepared or not self.enabled:
+            return
+        self._call("deleteWebhook", {"drop_pending_updates": False})
+        self._polling_prepared = True
+
     def get_updates(self, *, offset: int = 0, timeout: int = 1) -> list[dict]:
         if not self.enabled:
             return []
+        self.prepare_polling()
         result = self._call(
             "getUpdates",
             {"offset": int(offset), "timeout": timeout, "allowed_updates": ["message", "callback_query"]},

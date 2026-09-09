@@ -21,12 +21,25 @@ DIGEST_COOLDOWN_SECONDS = 30 * 60
 DIGEST_SIZE = 3
 FALLBACK_MIN_SCORE = 60
 FALLBACK_HOUR_LOCAL = 18
+TELEGRAM_UI_VERSION = "3"
+
+PANEL_COMMANDS = {
+    "🎯 Вакансии": "/vacancies",
+    "🔄 Обновить": "/refresh",
+    "📌 Сохранённые": "/saved",
+    "🔥 Отклики": "/applications",
+    "📊 Статистика": "/stats",
+    "🚫 Стоп-лист": "/blacklist",
+    "🔐 HH": "/hh_status",
+    "ℹ️ Помощь": "/help",
+}
 
 SKIP_REASONS = {
     "salary": "зарплата",
     "office": "офис / география",
     "seniority": "слишком высокий уровень",
     "stack": "не мой стек",
+    "direction": "не то направление",
     "other": "другое",
 }
 
@@ -162,6 +175,122 @@ def _stats_text(store: VacancyStore) -> str:
     )
 
 
+def _home_text(settings: Settings, store: VacancyStore) -> str:
+    oauth = _oauth_manager(settings, store)
+    status = "подключён" if oauth.connected() else ("готов к /hh_auth" if oauth.can_authorize else "не настроен")
+    return (
+        "🧭 JobRadar · панель управления\n\n"
+        "🎯 Вакансии — показать новые подходящие\n"
+        "🔄 Обновить — принудительно проверить HH\n"
+        "📌 Сохранённые — вернуться к отложенным\n"
+        "🔥 Отклики — текущая воронка\n"
+        "🚫 Стоп-лист — компании с повторными холодными отказами\n\n"
+        f"HH: {status} · основной порог: {settings.score_threshold}/100"
+    )
+
+
+def _help_text() -> str:
+    return (
+        "ℹ️ JobRadar\n\n"
+        "Бот сам собирает и ранжирует вакансии, пишет отдельное сопроводительное под каждую, "
+        "помнит решения и перестаёт предлагать компании после повторных холодных отказов.\n\n"
+        "У вакансии:\n"
+        "🔥 Отклик — персональное сопроводительное + форма HH\n"
+        "📌 Сохранить — отложить\n"
+        "❌ Мимо — выбрать причину, чтобы копить обратную связь\n"
+        "👁 HH — открыть оригинал вакансии\n\n"
+        "Команды: /vacancies /refresh /saved /applications /stats /blacklist /hh_status"
+    )
+
+
+def _saved_items(store: VacancyStore, limit: int = 3) -> list[RankedVacancy]:
+    rows = store.conn.execute(
+        """
+        SELECT * FROM vacancies
+        WHERE decision='saved'
+        ORDER BY COALESCE(decision_at, updated_at) DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    ).fetchall()
+    return [store._to_ranked(row) for row in rows]
+
+
+def _applications_text(store: VacancyStore) -> str:
+    rows = store.conn.execute(
+        """
+        SELECT a.status, a.applied_at, a.last_employer_event_at,
+               v.title, v.company
+        FROM applications a
+        LEFT JOIN vacancies v ON v.id=a.vacancy_id
+        ORDER BY COALESCE(a.last_employer_event_at, a.applied_at, a.updated_at) DESC
+        LIMIT 10
+        """
+    ).fetchall()
+    if not rows:
+        return "🔥 Откликов пока нет. У вакансии нажми «🔥 Отклик», а после отправки — «✅ Я откликнулся»."
+    labels = {
+        "applied": "📨 отклик",
+        "in_progress": "💬 в работе",
+        "invited": "🎉 приглашение",
+        "rejected": "📭 отказ",
+    }
+    lines = ["🔥 Отклики · последние 10"]
+    for row in rows:
+        status = labels.get(str(row["status"]), str(row["status"]))
+        title = str(row["title"] or "Вакансия")
+        company = str(row["company"] or "Компания")
+        lines.append(f"• {status} · {title} · {company}")
+    return "\n".join(lines)
+
+
+def _blacklist_text(store: VacancyStore) -> str:
+    feedback = store.company_feedback()
+    blocked = store.suppressed_companies()
+    if not blocked:
+        return "🚫 Стоп-лист пока пуст. Компания попадёт сюда после 3 отдельных холодных отказов."
+    rows = sorted(
+        ((name, feedback.get(name, {})) for name in blocked),
+        key=lambda item: (-int(item[1].get("cold_rejections", 0)), item[0]),
+    )
+    lines = ["🚫 Авто-стоп компаний"]
+    for name, stats in rows[:20]:
+        lines.append(f"• {name} — холодных отказов: {stats.get('cold_rejections', 0)}")
+    lines.append("\nИх новые вакансии JobRadar больше не присылает автоматически.")
+    return "\n".join(lines)
+
+
+def _skip_reason_markup(local_id: int) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "💰 Зарплата", "callback_data": f"skipr:{local_id}:salary"},
+                {"text": "🏢 Офис / город", "callback_data": f"skipr:{local_id}:office"},
+            ],
+            [
+                {"text": "🎓 Уровень", "callback_data": f"skipr:{local_id}:seniority"},
+                {"text": "🧩 Стек", "callback_data": f"skipr:{local_id}:stack"},
+            ],
+            [
+                {"text": "🧭 Не то направление", "callback_data": f"skipr:{local_id}:direction"},
+                {"text": "📝 Другое", "callback_data": f"skipr:{local_id}:other"},
+            ],
+        ]
+    }
+
+
+def _ensure_telegram_ui(store: VacancyStore, telegram: TelegramClient, settings: Settings) -> None:
+    if not telegram.enabled:
+        return
+    try:
+        telegram.configure_ui()
+        if telegram.can_send and store.get_setting("telegram_ui_version") != TELEGRAM_UI_VERSION:
+            telegram.send_home("✅ Панель JobRadar обновлена.\n\n" + _home_text(settings, store))
+            store.set_setting("telegram_ui_version", TELEGRAM_UI_VERSION)
+    except Exception as exc:
+        print(f"telegram ui error: {type(exc).__name__}", file=sys.stderr)
+
+
 def _handle_hh_auth_command(
     settings: Settings,
     store: VacancyStore,
@@ -225,9 +354,71 @@ def _handle_hh_auth_command(
     return False
 
 
+def _handle_panel_command(
+    settings: Settings,
+    store: VacancyStore,
+    telegram: TelegramClient,
+    command: str,
+) -> bool:
+    text = command.lower()
+
+    if text in {"/start", "/menu"}:
+        telegram.send_home(_home_text(settings, store))
+        return True
+
+    if text == "/vacancies":
+        sent = push_new(settings, store, telegram, force=True)
+        if sent == 0:
+            telegram.send_home("🎯 Новых вакансий выше текущего порога пока нет.")
+        return True
+
+    if text == "/refresh":
+        try:
+            found = collect(settings, store)
+            sent = push_new(settings, store, telegram, force=True)
+            if sent == 0:
+                telegram.send_home(f"🔄 Проверил HH: найдено/обновлено {found}. Новых подходящих для отправки сейчас нет.")
+            else:
+                telegram.send_text(f"🔄 HH обновлён: обработано {found}, показано новых вакансий: {sent}.")
+        except Exception as exc:
+            telegram.send_text(f"⚠️ Не удалось обновить вакансии: {type(exc).__name__}")
+        return True
+
+    if text == "/saved":
+        items = _saved_items(store)
+        if not items:
+            telegram.send_home("📌 Сохранённых вакансий пока нет.")
+        else:
+            telegram.send_digest(
+                items,
+                target_salary_rub=settings.target_salary_rub,
+                header="📌 Сохранённые вакансии",
+            )
+        return True
+
+    if text == "/applications":
+        telegram.send_text(_applications_text(store))
+        return True
+
+    if text == "/stats":
+        telegram.send_text(_stats_text(store))
+        return True
+
+    if text == "/blacklist":
+        telegram.send_text(_blacklist_text(store))
+        return True
+
+    if text == "/help":
+        telegram.send_home(_help_text())
+        return True
+
+    return False
+
+
 def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramClient, update: dict) -> None:
     message = update.get("message") or {}
     raw_text = (message.get("text") or "").strip()
+    raw_text = PANEL_COMMANDS.get(raw_text, raw_text)
     text = raw_text.lower()
     incoming_chat_id = _chat_id_from_update(update)
 
@@ -235,13 +426,12 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         if text == "/start" and incoming_chat_id:
             telegram.bind_chat(incoming_chat_id)
             store.set_setting("telegram_chat_id", incoming_chat_id)
-            telegram.send_text(
-                "✅ JobRadar привязан.\n"
-                "Тихий режим: максимум один дайджест за 30 минут и до 3 лучших вакансий.\n"
-                "Если топовых вакансий за день нет, вечером придёт один fallback 60–69/100.\n"
-                "После HH OAuth бот также следит за ответами работодателей и собеседованиями.\n"
-                "/stats — воронка · /hh_status — связь с HH."
-            )
+            try:
+                telegram.configure_ui()
+            except Exception:
+                pass
+            telegram.send_home("✅ JobRadar привязан.\n\n" + _home_text(settings, store))
+            store.set_setting("telegram_ui_version", TELEGRAM_UI_VERSION)
         return
 
     if not _authorized_chat(telegram, update):
@@ -253,19 +443,7 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
     if raw_text and _handle_hh_auth_command(settings, store, telegram, raw_text, message):
         return
 
-    if text == "/start":
-        oauth = _oauth_manager(settings, store)
-        status = "подключён" if oauth.connected() else ("готов к /hh_auth" if oauth.can_authorize else "ещё не настроен")
-        telegram.send_text(
-            "✅ JobRadar работает в тихом режиме.\n"
-            "70+/100 — основной дайджест; 60–69/100 — максимум один вечерний fallback, если день пустой.\n"
-            f"HH Inbox: {status}.\n"
-            "/stats — вакансии, отклики, приглашения и собесы."
-        )
-        return
-
-    if text == "/stats":
-        telegram.send_text(_stats_text(store))
+    if raw_text and _handle_panel_command(settings, store, telegram, raw_text):
         return
 
     callback = update.get("callback_query") or {}
@@ -292,8 +470,11 @@ def handle_update(settings: Settings, store: VacancyStore, telegram: TelegramCli
         return
 
     if action == "skip":
-        store.decide(local_id, "skipped", reason="other")
-        telegram.answer_callback(callback_id, "❌ Пропущено")
+        telegram.answer_callback(callback_id, "Выбери причину")
+        telegram.send_text(
+            f"❌ Почему мимо: {item.vacancy.title} · {item.vacancy.company}?",
+            reply_markup=_skip_reason_markup(local_id),
+        )
         return
 
     if action == "skipr" and extra in SKIP_REASONS:
@@ -471,6 +652,7 @@ def run_once(settings: Settings) -> int:
     store = VacancyStore(settings.db_path)
     telegram = _telegram_client(settings, store)
     try:
+        _ensure_telegram_ui(store, telegram, settings)
         found, sent = cycle(settings, store, telegram)
         inbox = poll_hh_inbox(settings, store, telegram)
         reminders = send_due_reminders(settings, store, telegram)
@@ -484,6 +666,7 @@ def run_tick(settings: Settings) -> int:
     store = VacancyStore(settings.db_path)
     telegram = _telegram_client(settings, store)
     try:
+        _ensure_telegram_ui(store, telegram, settings)
         found = collect(settings, store)
         processed = poll_updates(settings, store, telegram, timeout=0)
         inbox = poll_hh_inbox(settings, store, telegram)
@@ -502,6 +685,7 @@ def run_cron(settings: Settings) -> int:
     store = VacancyStore(settings.db_path)
     telegram = _telegram_client(settings, store)
     try:
+        _ensure_telegram_ui(store, telegram, settings)
         now_epoch = int(time.time())
         found = 0
         collected = False
@@ -569,6 +753,7 @@ def run_forever(settings: Settings) -> int:
     next_collect = 0.0
     next_inbox = 0.0
     try:
+        _ensure_telegram_ui(store, telegram, settings)
         while True:
             now = time.monotonic()
             if now >= next_collect:

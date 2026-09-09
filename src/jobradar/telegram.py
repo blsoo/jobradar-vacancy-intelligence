@@ -11,12 +11,38 @@ from .interview_prep import build_interview_prep
 from .models import RankedVacancy
 
 
+BOT_COMMANDS = [
+    {"command": "start", "description": "Главная панель JobRadar"},
+    {"command": "vacancies", "description": "Показать новые подходящие вакансии"},
+    {"command": "refresh", "description": "Обновить вакансии прямо сейчас"},
+    {"command": "saved", "description": "Сохранённые вакансии"},
+    {"command": "applications", "description": "Отклики и ответы работодателей"},
+    {"command": "stats", "description": "Статистика и воронка"},
+    {"command": "blacklist", "description": "Компании в авто-стопе"},
+    {"command": "hh_status", "description": "Статус подключения HeadHunter"},
+    {"command": "help", "description": "Что умеет JobRadar"},
+]
+
+MAIN_KEYBOARD = {
+    "keyboard": [
+        [{"text": "🎯 Вакансии"}, {"text": "🔄 Обновить"}],
+        [{"text": "📌 Сохранённые"}, {"text": "🔥 Отклики"}],
+        [{"text": "📊 Статистика"}, {"text": "🚫 Стоп-лист"}],
+        [{"text": "🔐 HH"}, {"text": "ℹ️ Помощь"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+    "input_field_placeholder": "JobRadar · выбери действие",
+}
+
+
 class TelegramClient:
     def __init__(self, token: str, chat_id: str = "", timeout: int = 20) -> None:
         self.token = token
         self.chat_id = chat_id
         self.timeout = timeout
         self._polling_prepared = False
+        self._ui_prepared = False
 
     @property
     def enabled(self) -> bool:
@@ -62,6 +88,17 @@ class TelegramClient:
             raise RuntimeError("Telegram chat is not bound yet")
         return target
 
+    def configure_ui(self) -> None:
+        """Install Telegram's slash-command panel and make the menu button open it."""
+        if self._ui_prepared or not self.enabled:
+            return
+        self._call("setMyCommands", {"commands": BOT_COMMANDS})
+        self._call("setChatMenuButton", {"menu_button": {"type": "commands"}})
+        self._ui_prepared = True
+
+    def send_home(self, text: str) -> None:
+        self.send_text(text, reply_markup=MAIN_KEYBOARD)
+
     @staticmethod
     def _salary_text(item: RankedVacancy) -> str:
         v = item.vacancy
@@ -74,12 +111,18 @@ class TelegramClient:
         prefix = "от" if v.salary_from is not None else "до"
         return f"{prefix} {value:,} {cur}".replace(",", " ")
 
-    def send_digest(self, items: list[RankedVacancy], *, target_salary_rub: int = 70_000) -> None:
+    def send_digest(
+        self,
+        items: list[RankedVacancy],
+        *,
+        target_salary_rub: int = 70_000,
+        header: str = "🎯 JobRadar · лучшие новые вакансии",
+    ) -> None:
         if not items:
             return
         items = items[:3]
         number_marks = ["1️⃣", "2️⃣", "3️⃣"]
-        chunks = ["🎯 <b>JobRadar · лучшие новые вакансии</b>"]
+        chunks = [f"<b>{html.escape(header)}</b>"]
         keyboard: list[list[dict]] = []
 
         for index, item in enumerate(items):
@@ -92,7 +135,8 @@ class TelegramClient:
             company = html.escape(v.company or "компания не указана")
             area = html.escape(v.area or "локация не указана")
             salary = html.escape(self._salary_text(item))
-            url = html.escape(v.url or v.application_url, quote=True)
+            url_raw = v.url or v.application_url
+            url = html.escape(url_raw, quote=True)
             work = html.escape(" · ".join(fit.work_with[:4]) or "задачи стоит уточнить")
             advantages = html.escape(" · ".join(fit.advantages[:4]) or "есть совпадение с целевым профилем")
 
@@ -113,6 +157,8 @@ class TelegramClient:
                     {"text": f"{index + 1} ❌ Мимо", "callback_data": f"skip:{item.local_id}"},
                 ]
             )
+            if url_raw:
+                keyboard.append([{"text": f"{index + 1} 👁 Открыть на HH", "url": url_raw}])
 
         chunks.append(
             "\n<i>Оценки — объяснимая эвристика по требованиям вакансии и целевому профилю, а не обещание оффера.</i>"
@@ -225,6 +271,7 @@ class TelegramClient:
         if self._polling_prepared or not self.enabled:
             return
         self._call("deleteWebhook", {"drop_pending_updates": False})
+        self.configure_ui()
         self._polling_prepared = True
 
     def get_updates(self, *, offset: int = 0, timeout: int = 1) -> list[dict]:

@@ -24,6 +24,9 @@ class FakeTelegram:
     def bind_chat(self, chat_id):
         self.chat_id = str(chat_id)
 
+    def configure_ui(self):
+        pass
+
     def get_updates(self, *, offset=0, timeout=1):
         self.offsets.append(offset)
         if offset != 0:
@@ -34,6 +37,9 @@ class FakeTelegram:
         ]
 
     def send_text(self, text, *, reply_markup=None, chat_id=None):
+        self.messages.append(text)
+
+    def send_home(self, text):
         self.messages.append(text)
 
     def send_vacancy(self, item):

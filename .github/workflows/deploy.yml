@@ -1,0 +1,235 @@
+name: Deploy JobRadar
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: jobradar-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate the live JobRadar service
+        id: live
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t containers < <(
+            docker ps \
+              --filter 'label=com.docker.compose.service=jobradar' \
+              --format '{{.ID}}'
+          )
+          if [ "${#containers[@]}" -ne 1 ]; then
+            echo "Expected exactly one live Compose service named jobradar; found ${#containers[@]}." >&2
+            exit 1
+          fi
+
+          cid="${containers[0]}"
+          project="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$cid")"
+          image_id="$(docker inspect -f '{{.Image}}' "$cid")"
+          image_name="$(docker inspect -f '{{.Config.Image}}' "$cid")"
+          mount_type="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}}{{end}}{{end}}' "$cid")"
+          data_volume="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$cid")"
+
+          if [ -z "$project" ] || [ -z "$image_id" ] || [ -z "$image_name" ]; then
+            echo "The live container is missing Compose/image metadata; refusing to deploy." >&2
+            exit 1
+          fi
+          if [ "$mount_type" != "volume" ] || [ -z "$data_volume" ]; then
+            echo "The live /data mount is not a named Docker volume; refusing to risk the runtime database." >&2
+            exit 1
+          fi
+
+          echo "container=$cid" >> "$GITHUB_OUTPUT"
+          echo "project=$project" >> "$GITHUB_OUTPUT"
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          echo "image_name=$image_name" >> "$GITHUB_OUTPUT"
+          echo "data_volume=$data_volume" >> "$GITHUB_OUTPUT"
+          echo "Found one live JobRadar Compose service with a persistent /data volume."
+
+      - name: Preserve runtime environment and database
+        env:
+          LIVE_CONTAINER: ${{ steps.live.outputs.container }}
+          LIVE_IMAGE: ${{ steps.live.outputs.image_id }}
+          DATA_VOLUME: ${{ steps.live.outputs.data_volume }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          backup_dir="$RUNNER_TEMP/jobradar-deploy-backup"
+          rm -rf "$backup_dir"
+          mkdir -p "$backup_dir"
+
+          # SQLite online backup gives a consistent snapshot even if the worker is live.
+          docker exec "$LIVE_CONTAINER" python -c '
+          import os, sqlite3
+          path = os.getenv("JOBRADAR_DB", "/data/jobradar.db")
+          src = sqlite3.connect(path)
+          dst = sqlite3.connect("/tmp/jobradar-deploy-backup.db")
+          src.backup(dst)
+          result = dst.execute("PRAGMA integrity_check").fetchone()[0]
+          dst.close(); src.close()
+          assert result == "ok", result
+          '
+          docker cp "$LIVE_CONTAINER:/tmp/jobradar-deploy-backup.db" "$backup_dir/jobradar.db"
+          docker exec "$LIVE_CONTAINER" rm -f /tmp/jobradar-deploy-backup.db
+
+          BACKUP_DB="$backup_dir/jobradar.db" python - <<'PY'
+          import os, sqlite3
+          db = os.environ["BACKUP_DB"]
+          conn = sqlite3.connect(db)
+          result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+          conn.close()
+          if result != "ok":
+              raise SystemExit(f"backup integrity check failed: {result}")
+          print("SQLite backup integrity: ok")
+          PY
+
+          # Keep only JobRadar-owned runtime settings. Never print their values.
+          LIVE_CONTAINER="$LIVE_CONTAINER" python - <<'PY'
+          import json, os, pathlib, subprocess
+          cid = os.environ["LIVE_CONTAINER"]
+          raw = subprocess.check_output(
+              ["docker", "inspect", "-f", "{{json .Config.Env}}", cid], text=True
+          )
+          entries = json.loads(raw)
+          allowed = ("TELEGRAM_", "JOBRADAR_", "HH_", "EMAIL_")
+          env = {}
+          for entry in entries:
+              key, sep, value = entry.partition("=")
+              if sep and key.startswith(allowed):
+                  env[key] = value
+          if not env.get("TELEGRAM_BOT_TOKEN"):
+              raise SystemExit("live container has no TELEGRAM_BOT_TOKEN")
+          # From now on the DB is always inside the persistent volume.
+          env["JOBRADAR_DB"] = "/data/jobradar.db"
+
+          def quote(value: str) -> str:
+              value = value.replace("\\", "\\\\").replace('"', '\\"')
+              value = value.replace("\n", "\\n").replace("\r", "\\r")
+              return f'"{value}"'
+
+          pathlib.Path(".env").write_text(
+              "".join(f"{key}={quote(value)}\n" for key, value in sorted(env.items())),
+              encoding="utf-8",
+          )
+          print(f"Preserved {len(env)} JobRadar runtime variables without exposing values.")
+          PY
+
+          # Seed the exact existing volume with the verified backup before recreation.
+          docker run --rm \
+            --entrypoint python \
+            -v "$DATA_VOLUME:/data" \
+            -v "$backup_dir:/backup:ro" \
+            "$LIVE_IMAGE" \
+            -c 'import shutil; shutil.copy2("/backup/jobradar.db", "/data/jobradar.db")'
+
+      - name: Build new image before touching the live container
+        env:
+          COMPOSE_PROJECT: ${{ steps.live.outputs.project }}
+          DATA_VOLUME: ${{ steps.live.outputs.data_volume }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compose.deploy.yaml <<EOF
+          volumes:
+            jobradar-data:
+              external: true
+              name: ${DATA_VOLUME}
+          EOF
+          docker compose \
+            -p "$COMPOSE_PROJECT" \
+            -f compose.yaml \
+            -f compose.deploy.yaml \
+            build jobradar
+
+      - name: Recreate the live service
+        env:
+          COMPOSE_PROJECT: ${{ steps.live.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          touch "$RUNNER_TEMP/jobradar-deployment-started"
+          docker compose \
+            -p "$COMPOSE_PROJECT" \
+            -f compose.yaml \
+            -f compose.deploy.yaml \
+            up -d --no-build --force-recreate jobradar
+
+      - name: Verify runtime, database and Telegram polling mode
+        env:
+          COMPOSE_PROJECT: ${{ steps.live.outputs.project }}
+          DATA_VOLUME: ${{ steps.live.outputs.data_volume }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 8
+          cid="$(docker compose -p "$COMPOSE_PROJECT" -f compose.yaml -f compose.deploy.yaml ps -q jobradar)"
+          if [ -z "$cid" ]; then
+            echo "JobRadar container is missing after recreation." >&2
+            exit 1
+          fi
+          state="$(docker inspect -f '{{.State.Status}}' "$cid")"
+          [ "$state" = "running" ] || { echo "JobRadar state: $state" >&2; exit 1; }
+
+          mounted="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$cid")"
+          [ "$mounted" = "$DATA_VOLUME" ] || { echo "Persistent volume changed unexpectedly." >&2; exit 1; }
+
+          docker exec "$cid" python -c '
+          import os, sqlite3
+          path = os.getenv("JOBRADAR_DB")
+          assert path == "/data/jobradar.db", path
+          conn = sqlite3.connect(path)
+          result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+          conn.close()
+          assert result == "ok", result
+          print("Runtime database integrity: ok")
+          '
+
+          # getWebhookInfo does not consume updates. JobRadar itself deletes stale
+          # webhooks before getUpdates, so an empty URL is required for buttons.
+          docker exec "$cid" python -c '
+          import json, os
+          from urllib.request import urlopen
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          with urlopen(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=15) as r:
+              payload = json.load(r)
+          url = str((payload.get("result") or {}).get("url") or "")
+          assert payload.get("ok") and not url, "Telegram webhook is still active"
+          print("Telegram webhook: disabled; long polling owns callbacks")
+          '
+
+          if docker logs --since 30s "$cid" 2>&1 | grep -Eq 'runtime error:|telegram poll error:'; then
+            echo "JobRadar reported a runtime/polling error after deployment." >&2
+            docker logs --since 30s "$cid" 2>&1 | grep -E 'runtime error:|telegram poll error:' >&2 || true
+            exit 1
+          fi
+          echo "JobRadar deployment verified."
+
+      - name: Roll back image if verification fails
+        if: failure()
+        env:
+          COMPOSE_PROJECT: ${{ steps.live.outputs.project }}
+          OLD_IMAGE_ID: ${{ steps.live.outputs.image_id }}
+          OLD_IMAGE_NAME: ${{ steps.live.outputs.image_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "$RUNNER_TEMP/jobradar-deployment-started" ]; then
+            echo "Deployment never started; no rollback needed."
+            exit 0
+          fi
+          echo "Verification failed; restoring previous image."
+          docker tag "$OLD_IMAGE_ID" "$OLD_IMAGE_NAME"
+          docker compose \
+            -p "$COMPOSE_PROJECT" \
+            -f compose.yaml \
+            -f compose.deploy.yaml \
+            up -d --no-build --force-recreate jobradar
+          echo "Previous image restored."

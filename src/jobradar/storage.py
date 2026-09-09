@@ -9,6 +9,18 @@ from typing import Iterable
 from .models import RankedVacancy, ScoreResult, Vacancy
 
 
+DEFAULT_COMPANY_REJECTION_THRESHOLD = 3
+
+
+def _company_key(value: str) -> str:
+    text = " ".join((value or "").casefold().replace("«", "").replace("»", "").replace('"', "").split())
+    for prefix in ("ооо ", "ао ", "пао ", "зао ", "ип "):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    return text
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vacancies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +157,59 @@ class VacancyStore:
         ).fetchall()
         return {str(row["key"]): str(row["value"]) for row in rows}
 
+    def company_feedback(self) -> dict[str, dict[str, int]]:
+        rows = self.conn.execute(
+            """
+            SELECT a.id AS application_id, v.company, e.event_type
+            FROM applications a
+            JOIN vacancies v ON v.id=a.vacancy_id
+            JOIN employer_events e ON e.application_id=a.id
+            WHERE e.event_type IN ('positive', 'rejection')
+            ORDER BY a.id, e.id
+            """
+        ).fetchall()
+
+        applications: dict[int, dict[str, object]] = {}
+        for row in rows:
+            application_id = int(row["application_id"])
+            entry = applications.setdefault(
+                application_id,
+                {"company": str(row["company"] or ""), "events": set()},
+            )
+            events = entry["events"]
+            if isinstance(events, set):
+                events.add(str(row["event_type"]))
+
+        companies: dict[str, dict[str, int]] = {}
+        for entry in applications.values():
+            company = _company_key(str(entry["company"] or ""))
+            if not company:
+                continue
+            events = entry["events"] if isinstance(entry["events"], set) else set()
+            stats = companies.setdefault(
+                company,
+                {"applications": 0, "rejections": 0, "positive": 0, "cold_rejections": 0},
+            )
+            stats["applications"] += 1
+            if "rejection" in events:
+                stats["rejections"] += 1
+            if "positive" in events:
+                stats["positive"] += 1
+            if "rejection" in events and "positive" not in events:
+                stats["cold_rejections"] += 1
+        return companies
+
+    def suppressed_companies(
+        self,
+        rejection_threshold: int = DEFAULT_COMPANY_REJECTION_THRESHOLD,
+    ) -> set[str]:
+        threshold = max(1, int(rejection_threshold))
+        return {
+            company
+            for company, stats in self.company_feedback().items()
+            if stats.get("cold_rejections", 0) >= threshold
+        }
+
     def upsert(self, ranked: RankedVacancy) -> int:
         v = ranked.vacancy
         payload = json.dumps(asdict(v), ensure_ascii=False)
@@ -191,6 +256,9 @@ class VacancyStore:
         return [self.upsert(item) for item in ranked]
 
     def unsent(self, threshold: int, limit: int) -> list[RankedVacancy]:
+        if limit <= 0:
+            return []
+        blocked = self.suppressed_companies()
         rows = self.conn.execute(
             """
             SELECT * FROM vacancies
@@ -198,11 +266,17 @@ class VacancyStore:
               AND decision IS NULL
               AND score >= ?
             ORDER BY score DESC, published_at DESC
-            LIMIT ?
             """,
-            (threshold, limit),
+            (threshold,),
         ).fetchall()
-        return [self._to_ranked(row) for row in rows]
+        result: list[RankedVacancy] = []
+        for row in rows:
+            if _company_key(str(row["company"] or "")) in blocked:
+                continue
+            result.append(self._to_ranked(row))
+            if len(result) >= limit:
+                break
+        return result
 
     def get(self, local_id: int) -> RankedVacancy | None:
         row = self.conn.execute("SELECT * FROM vacancies WHERE id=?", (local_id,)).fetchone()

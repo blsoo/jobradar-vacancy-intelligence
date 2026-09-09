@@ -2,108 +2,186 @@
 
 ## Goal
 
-Reduce vacancy noise and make the path from discovery to deliberate application short, explainable and auditable.
+Reduce vacancy noise and keep the applicant workflow — discovery, decision, application, employer response and interview — explainable, persistent and auditable.
+
+For a requirement/use-case/data-model view, see [`docs/SYSTEM_ANALYSIS.md`](docs/SYSTEM_ANALYSIS.md).
 
 ## System context
 
 ```mermaid
 flowchart LR
-    HH[HeadHunter API] --> C[Collector]
+    HHV[HeadHunter vacancies] --> C[Collector]
     C --> N[Normalizer]
-    N --> S[Deterministic Scoring]
-    S --> D[(SQLite)]
-    D --> Q[Delivery Queue]
+    N --> S[Explainable scoring]
+    S --> DB[(SQLite runtime store)]
+    DB --> Q[Delivery queue]
     Q --> TG[Telegram]
-    TG --> A[User Action]
-    A --> D
-    A --> EXT[External application flow]
+    TG --> U[Applicant]
+    U --> TG
+    TG --> D[Decision handler]
+    D --> DB
+
+    U --> HHAUTH[HH OAuth]
+    HHAUTH --> HHC[HH applicant chats]
+    HHC --> INBOX[Inbox adapter]
+    INBOX --> E[Employer event classifier]
+    E --> DB
+    E --> I[Interview date parser]
+    I --> DB
+    DB --> R[Reminder scheduler]
+    R --> TG
+
+    D --> HHFORM[Official HH application form]
 ```
 
-## Delivery sequence
+The current application boundary is intentionally conservative: JobRadar prepares the application and opens the official HH flow, but `applied` is recorded only after explicit user confirmation. Automatic API submission remains a separate roadmap item.
+
+## Main runtime components
+
+| Component | Responsibility |
+| --- | --- |
+| `HHClient` | Vacancy discovery and source normalization inputs |
+| `Vacancy` / models | Stable internal vacancy representation |
+| scoring | Deterministic fit/risk evaluation with human-readable evidence |
+| `VacancyStore` | Persistent vacancies, decisions, applications, employer events, interviews, reminders and runtime cursors |
+| Telegram client/handlers | Owner-only UI, digests, callbacks, commands and notifications |
+| `HHOAuthManager` | Applicant OAuth state, code exchange, token persistence/refresh and applicant verification |
+| `HHInboxClient` | Read-only HH employer chat integration |
+| employer classifier | Distinguishes ordinary messages, positive/invitation events and rejections |
+| interview parser | Extracts explicit interview date/time evidence |
+| reminder scheduler | Persists and delivers 24h / 2h / 30m reminders |
+
+## Vacancy delivery sequence
 
 ```mermaid
 sequenceDiagram
-    participant H as HH API
+    participant H as HH
     participant J as JobRadar
-    participant DB as SQLite
+    participant DB as Store
     participant T as Telegram
-    participant U as User
+    participant U as Applicant
 
-    J->>H: GET /vacancies
+    J->>H: discover vacancies
     H-->>J: vacancy items
     J->>J: normalize + score
     J->>DB: UPSERT(source, external_id)
-    DB-->>J: unsent high-score queue
-    J->>T: send vacancy card
-    T-->>U: inline actions
-    U->>T: Save / Skip / Prepare application
-    T->>J: callback_query
-    J->>DB: persist decision event
+    DB-->>J: unsent eligible queue
+    J->>T: send bounded digest
+    T-->>J: delivery accepted
+    J->>DB: mark sent
+    T-->>U: vacancy cards + actions
+    U->>T: Save / Skip / Apply
+    T->>J: authorized callback
+    J->>DB: persist decision/event
 ```
 
-## Core rules
+If Telegram does not accept the digest, JobRadar does not mark the vacancy sent.
 
-1. `(source, external_id)` is the deduplication key.
-2. A Telegram notification is marked sent only after Telegram accepts the message.
-3. Scoring is deterministic and stores human-readable reasons.
-4. A callback changes only JobRadar state unless an explicit external adapter is authorized.
-5. Application submission must fail closed when OAuth or vacancy-specific action metadata is unavailable.
-6. Runtime secrets live in environment variables, never in the repository.
-7. Unknown Telegram chats cannot mutate state.
-
-## Scoring model
-
-The first version is deliberately transparent rather than ML-based. It rewards signals useful for junior system-analysis work and applies penalties to obviously senior roles.
-
-```mermaid
-flowchart TD
-    V[Vacancy] --> K[Keyword evidence]
-    V --> R[Remote signal]
-    V --> E[Experience bucket]
-    V --> P[Salary signal]
-    K --> SCORE[0..100 score]
-    R --> SCORE
-    E --> SCORE
-    P --> SCORE
-    SCORE --> WHY[matched + risks + reasons]
-```
-
-A future feedback model can learn from `saved`, `skipped`, `apply_requested`, `applied`, interview and offer events, but it should remain inspectable and must not silently replace hard safety filters.
-
-## Application boundary
-
-The public vacancy search can run without an HH OAuth token. Applying is a separate concern.
+## Application state boundary
 
 ```mermaid
 stateDiagram-v2
     [*] --> Discovered
-    Discovered --> Sent: score >= threshold
+    Discovered --> Sent: digest delivered
     Sent --> Saved
     Sent --> Skipped
-    Sent --> ApplyRequested
-    ApplyRequested --> Applied: user confirms real submission
-    ApplyRequested --> ExternalOAuthAction: future adapter
-    ExternalOAuthAction --> Applied: API confirms success
-    ExternalOAuthAction --> ApplyRequested: unavailable / denied / failed
+    Sent --> ApplyRequested: Apply selected
+    ApplyRequested --> Applied: real submission confirmed
+    Applied --> InProgress: employer activity
+    InProgress --> Invited: positive / interview message
+    InProgress --> Rejected: rejection
+    Invited --> InterviewScheduled: reliable datetime extracted
 ```
 
-The important invariant is that `Applied` must never mean "the bot tried". It means either the user confirmed the real submission or an authorized adapter received a successful platform response.
+The key invariant is that `Applied` never means "the bot tried". Opening an application URL or generating a cover letter is not considered success.
+
+## Employer-response sequence
+
+```mermaid
+sequenceDiagram
+    participant J as JobRadar
+    participant O as OAuth manager
+    participant H as HH applicant chats
+    participant DB as Store
+    participant T as Telegram
+
+    J->>O: request valid applicant token
+    O-->>J: access token / fail closed
+    J->>H: GET chats/messages
+    H-->>J: employer messages
+    J->>DB: check source event identity
+    alt new employer event
+        J->>J: classify message
+        J->>DB: persist event + funnel state
+        J->>J: attempt interview datetime extraction
+        opt reliable datetime
+            J->>DB: upsert interview + reminders
+        end
+        J->>T: notify applicant
+        T-->>J: accepted
+        J->>DB: mark event notification delivered
+    else already processed
+        J->>J: no duplicate effect
+    end
+```
 
 ## Persistence
 
-Current MVP uses SQLite to make local/VPS deployment dependency-free. The repository boundary is intentionally small so PostgreSQL can replace it later without changing scoring or Telegram behavior.
-
-Tables:
+The current runtime uses SQLite. Persistent entities are separated by responsibility:
 
 - `vacancies` — normalized vacancy snapshot, score, delivery state and latest decision;
-- `decision_events` — append-only decision history for later feedback analysis.
+- `decision_events` — decision history;
+- `applications` — applicant-side funnel state;
+- `employer_events` — source events from employer communication;
+- `interviews` — extracted scheduled interviews;
+- `interview_reminders` — reminder delivery state;
+- `runtime_settings` — durable cursors/configuration state such as Telegram binding and polling/digest cursors.
 
-## Next steps
+Key uniqueness/idempotency boundaries include `(source, external_id)` for vacancies, source event identity for employer events, and `(interview_id, kind)` for reminders.
 
-- HH applicant OAuth and vacancy-specific allowed-action discovery;
-- PostgreSQL adapter and migrations;
-- richer feedback reasons for skipped vacancies;
-- multiple sources behind a common `VacancySource` interface;
-- daily digest and quiet hours;
-- application funnel: applied → viewed → interview → offer;
-- optional ranking model trained only after enough real feedback exists.
+## Security and mutation boundaries
+
+1. The applicant's HH login/password is never collected.
+2. Personal HH data requires applicant OAuth.
+3. OAuth `state` is validated before code exchange.
+4. Access/refresh tokens live only in the protected runtime database/environment, never in the public repository.
+5. HH chat integration is read-only.
+6. Unknown Telegram chats cannot mutate applicant state.
+7. External application submission is not assumed successful from an attempt.
+8. Missing authorization causes OAuth-only behaviour to fail closed.
+
+## Reliability rules
+
+1. Repeated collection does not duplicate vacancy identity.
+2. Repeating the same decision does not append the same decision event again.
+3. Repeated inbox polling does not duplicate employer events/notifications.
+4. Interview reminders survive process restarts.
+5. A reminder is marked sent only after Telegram accepts it.
+6. A positive employer message without reliable date/time is still stored/notified, but no schedule is invented.
+7. Collection frequency is independent from notification frequency, preventing polling cadence from becoming notification spam.
+
+## Current vs roadmap
+
+### Implemented
+
+- HH vacancy discovery and normalization;
+- explainable vacancy scoring;
+- persistent deduplication and delivery state;
+- quiet top-3 Telegram digests and evening fallback;
+- Save / Skip / Apply workflow;
+- structured skip reasons;
+- applicant OAuth lifecycle;
+- HH employer chat monitoring;
+- employer response/rejection classification;
+- persistent application funnel;
+- interview date/time extraction;
+- reminder scheduling/delivery;
+- tests and CI.
+
+### Planned
+
+- safe one-tap HH application adapter with vacancy-specific capability checks;
+- PostgreSQL repository and migrations while keeping SQLite local/demo mode;
+- additional vacancy-source adapters and feedback-aware ranking.
+
+The roadmap is intentionally not presented as already implemented functionality.

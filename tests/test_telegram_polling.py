@@ -6,7 +6,7 @@ from jobradar.app import handle_update
 from jobradar.config import Settings
 from jobradar.models import RankedVacancy, ScoreResult, Vacancy
 from jobradar.storage import VacancyStore
-from jobradar.telegram import TelegramClient
+from jobradar.telegram import BOT_COMMANDS, MAIN_KEYBOARD, TelegramClient
 
 
 class RecordingTelegram(TelegramClient):
@@ -26,6 +26,8 @@ class FakeCallbackTelegram:
         self.chat_id = "42"
         self.answers = []
         self.messages = []
+        self.home_messages = []
+        self.ui_configured = 0
 
     @property
     def enabled(self):
@@ -35,26 +37,54 @@ class FakeCallbackTelegram:
     def can_send(self):
         return True
 
+    def configure_ui(self):
+        self.ui_configured += 1
+
     def answer_callback(self, callback_query_id, text):
         self.answers.append((callback_query_id, text))
 
     def send_text(self, text, *, reply_markup=None, chat_id=None):
         self.messages.append((text, reply_markup))
 
+    def send_home(self, text):
+        self.home_messages.append((text, MAIN_KEYBOARD))
+
 
 class TelegramPollingTests(unittest.TestCase):
-    def test_get_updates_removes_stale_webhook_once_without_dropping_updates(self):
+    def test_get_updates_recovers_webhook_and_installs_command_menu_once(self):
         telegram = RecordingTelegram()
 
         telegram.get_updates(offset=10, timeout=0)
         telegram.get_updates(offset=11, timeout=0)
 
         methods = [method for method, _ in telegram.calls]
-        self.assertEqual(methods, ["deleteWebhook", "getUpdates", "getUpdates"])
         self.assertEqual(
-            telegram.calls[0][1],
-            {"drop_pending_updates": False},
+            methods,
+            ["deleteWebhook", "setMyCommands", "setChatMenuButton", "getUpdates", "getUpdates"],
         )
+        self.assertEqual(telegram.calls[0][1], {"drop_pending_updates": False})
+        self.assertEqual(telegram.calls[1][1]["commands"], BOT_COMMANDS)
+        self.assertEqual(
+            telegram.calls[2][1],
+            {"menu_button": {"type": "commands"}},
+        )
+
+    def test_main_keyboard_has_all_primary_sections(self):
+        labels = [button["text"] for row in MAIN_KEYBOARD["keyboard"] for button in row]
+        self.assertEqual(
+            labels,
+            [
+                "🎯 Вакансии",
+                "🔄 Обновить",
+                "📌 Сохранённые",
+                "🔥 Отклики",
+                "📊 Статистика",
+                "🚫 Стоп-лист",
+                "🔐 HH",
+                "ℹ️ Помощь",
+            ],
+        )
+        self.assertTrue(MAIN_KEYBOARD["is_persistent"])
 
 
 class CallbackTests(unittest.TestCase):
@@ -99,14 +129,23 @@ class CallbackTests(unittest.TestCase):
         self.store.close()
         os.unlink(self.path)
 
-    def callback(self, action):
+    def callback(self, action, extra=None):
+        data = f"{action}:{self.local_id}"
+        if extra is not None:
+            data += f":{extra}"
         return {
             "update_id": 1,
             "callback_query": {
                 "id": f"cb-{action}",
-                "data": f"{action}:{self.local_id}",
+                "data": data,
                 "message": {"chat": {"id": 42}},
             },
+        }
+
+    def message(self, text):
+        return {
+            "update_id": 2,
+            "message": {"text": text, "chat": {"id": 42}},
         }
 
     def decision(self):
@@ -115,15 +154,33 @@ class CallbackTests(unittest.TestCase):
         ).fetchone()
         return row["decision"]
 
+    def decision_reason(self):
+        row = self.store.conn.execute(
+            "SELECT decision_reason FROM vacancies WHERE id=?", (self.local_id,)
+        ).fetchone()
+        return row["decision_reason"]
+
     def test_save_button_persists_decision_and_acknowledges_callback(self):
         handle_update(self.settings, self.store, self.telegram, self.callback("save"))
         self.assertEqual(self.decision(), "saved")
         self.assertEqual(self.telegram.answers[-1][0], "cb-save")
 
-    def test_skip_button_persists_decision_and_acknowledges_callback(self):
+    def test_skip_button_asks_reason_before_persisting(self):
         handle_update(self.settings, self.store, self.telegram, self.callback("skip"))
+        self.assertIsNone(self.decision())
+        text, markup = self.telegram.messages[-1]
+        self.assertIn("Почему мимо", text)
+        callback_data = [
+            button["callback_data"]
+            for row in markup["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn(f"skipr:{self.local_id}:salary", callback_data)
+        self.assertIn(f"skipr:{self.local_id}:direction", callback_data)
+
+        handle_update(self.settings, self.store, self.telegram, self.callback("skipr", "direction"))
         self.assertEqual(self.decision(), "skipped")
-        self.assertEqual(self.telegram.answers[-1][0], "cb-skip")
+        self.assertEqual(self.decision_reason(), "direction")
 
     def test_apply_button_builds_vacancy_specific_letter_and_followup_button(self):
         handle_update(self.settings, self.store, self.telegram, self.callback("apply"))
@@ -141,6 +198,16 @@ class CallbackTests(unittest.TestCase):
         handle_update(self.settings, self.store, self.telegram, self.callback("applied"))
         self.assertEqual(self.decision(), "applied")
         self.assertEqual(self.store.application_stats().get("applied"), 1)
+
+    def test_panel_stats_button_routes_without_slash_command(self):
+        handle_update(self.settings, self.store, self.telegram, self.message("📊 Статистика"))
+        self.assertIn("📊 JobRadar", self.telegram.messages[-1][0])
+
+    def test_help_button_restores_persistent_home_panel(self):
+        handle_update(self.settings, self.store, self.telegram, self.message("ℹ️ Помощь"))
+        text, markup = self.telegram.home_messages[-1]
+        self.assertIn("🔥 Отклик", text)
+        self.assertTrue(markup["is_persistent"])
 
 
 if __name__ == "__main__":

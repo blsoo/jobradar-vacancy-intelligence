@@ -16,10 +16,10 @@ BOT_COMMANDS = [
     {"command": "vacancies", "description": "Показать новые подходящие вакансии"},
     {"command": "refresh", "description": "Обновить вакансии прямо сейчас"},
     {"command": "saved", "description": "Сохранённые вакансии"},
-    {"command": "applications", "description": "Отклики и ответы работодателей"},
+    {"command": "applications", "description": "Отклики и статусы"},
+    {"command": "responses", "description": "Ответы работодателей"},
     {"command": "stats", "description": "Статистика и воронка"},
     {"command": "blacklist", "description": "Компании в авто-стопе"},
-    {"command": "hh_status", "description": "Статус подключения HeadHunter"},
     {"command": "help", "description": "Что умеет JobRadar"},
 ]
 
@@ -27,8 +27,8 @@ MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "🎯 Вакансии"}, {"text": "🔄 Обновить"}],
         [{"text": "📌 Сохранённые"}, {"text": "🔥 Отклики"}],
-        [{"text": "📊 Статистика"}, {"text": "🚫 Стоп-лист"}],
-        [{"text": "🔐 HH"}, {"text": "ℹ️ Помощь"}],
+        [{"text": "📬 Ответы"}, {"text": "📊 Статистика"}],
+        [{"text": "🚫 Стоп-лист"}, {"text": "ℹ️ Помощь"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -75,7 +75,6 @@ class TelegramClient:
                 description = str(error_payload.get("description") or description)
             except Exception:
                 pass
-            # Never include the request URL here: it contains the bot token.
             raise RuntimeError(f"Telegram API {method} failed: {description}") from None
         if not result.get("ok"):
             description = str(result.get("description") or "unknown Telegram error")
@@ -89,7 +88,6 @@ class TelegramClient:
         return target
 
     def configure_ui(self) -> None:
-        """Install Telegram's slash-command panel and make the menu button open it."""
         if self._ui_prepared or not self.enabled:
             return
         self._call("setMyCommands", {"commands": BOT_COMMANDS})
@@ -187,8 +185,7 @@ class TelegramClient:
         target_salary_rub: int = 70_000,
     ) -> None:
         if item is None:
-            text = f"🎉 Положительный ответ от работодателя\n{sender_name}\n\n{message_text[:900]}"
-            self.send_text(text)
+            self.send_text(f"🎉 Положительный ответ от работодателя\n{sender_name}\n\n{message_text[:900]}")
             return
         fit = evaluate_career_fit(item, target_salary_rub=target_salary_rub)
         prep = build_interview_prep(item)
@@ -261,13 +258,6 @@ class TelegramClient:
         self._call("deleteMessage", {"chat_id": str(chat_id), "message_id": int(message_id)})
 
     def prepare_polling(self) -> None:
-        """Ensure long polling owns the bot update stream.
-
-        Telegram refuses getUpdates while a webhook is configured. JobRadar is a
-        long-polling bot, so an old webhook left behind by a previous deployment
-        must not silently disable callback buttons. deleteWebhook is idempotent
-        and does not drop queued updates here.
-        """
         if self._polling_prepared or not self.enabled:
             return
         self._call("deleteWebhook", {"drop_pending_updates": False})

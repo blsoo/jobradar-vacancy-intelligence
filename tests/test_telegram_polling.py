@@ -172,7 +172,7 @@ class CallbackTests(unittest.TestCase):
         text, markup = self.telegram.messages[-1]
         self.assertIn("Junior System Analyst", text)
         self.assertIn("REST API", text)
-        self.assertNotIn("HH OAuth", text)
+        self.assertNotIn("После HH OAuth", text)
         self.assertEqual(markup["inline_keyboard"][1][0]["callback_data"], f"applied:{self.local_id}")
 
     def test_applied_button_offers_manual_response_tracking(self):
@@ -186,7 +186,7 @@ class CallbackTests(unittest.TestCase):
         self.assertIn(f"resp:{self.local_id}:message", data)
         self.assertIn(f"resp:{self.local_id}:rejection", data)
 
-    def test_manual_response_updates_application_without_hh_oauth(self):
+    def test_manual_response_updates_application_without_hh_credentials(self):
         handle_update(self.settings, self.store, self.telegram, self.callback("applied"))
         handle_update(self.settings, self.store, self.telegram, self.callback("resp", "rejection"))
         self.assertEqual(self.store.application_stats().get("rejected"), 1)
@@ -197,7 +197,7 @@ class CallbackTests(unittest.TestCase):
         handle_update(self.settings, self.store, self.telegram, self.message("📊 Статистика"))
         self.assertIn("📊 JobRadar", self.telegram.messages[-1][0])
 
-    def test_responses_panel_explains_non_oauth_tracking(self):
+    def test_responses_panel_explains_available_tracking(self):
         handle_update(self.settings, self.store, self.telegram, self.message("📬 Ответы"))
         text = self.telegram.messages[-1][0]
         self.assertIn("Ответы работодателей", text)
@@ -208,7 +208,7 @@ class CallbackTests(unittest.TestCase):
         handle_update(self.settings, self.store, self.telegram, self.message("ℹ️ Помощь"))
         text, markup = self.telegram.home_messages[-1]
         self.assertIn("🔥 Отклик", text)
-        self.assertNotIn("OAuth", text)
+        self.assertNotIn("client_id", text)
         self.assertTrue(markup["is_persistent"])
 
 

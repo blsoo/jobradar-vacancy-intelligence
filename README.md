@@ -18,6 +18,15 @@ HH discovery
     -> reminders: 24h / 2h / 30m
 ```
 
+## System-analysis documentation
+
+This repository is also maintained as a system-analysis case, not only as source code:
+
+- [System analysis: requirements, use cases, states, data model, integrations, NFR and traceability](docs/SYSTEM_ANALYSIS.md)
+- [Current architecture and reliability boundaries](ARCHITECTURE.md)
+
+The documentation separates **implemented behaviour** from roadmap items so architectural claims can be traced back to code/tests.
+
 ## Working behaviour
 
 The current code can:
@@ -196,4 +205,6 @@ Important values:
 
 ## Portfolio value
 
-The repository now demonstrates vacancy discovery, explainable ranking, career-fit reasoning, persistent application-state modelling, OAuth lifecycle design, personal inbox integration, event deduplication, date extraction, reminder scheduling, Telegram UX, tests and CI without pretending that an OAuth-disabled feature is already active.
+JobRadar demonstrates a complete applicant workflow rather than an isolated script: vacancy discovery, explainable ranking, state modelling, OAuth lifecycle, read-only external integration, event deduplication, application-funnel tracking, interview extraction, reminders, Telegram UX, tests and CI.
+
+The system-analysis case is documented separately so requirements, state transitions, integration boundaries, persistence rules and reliability decisions can be reviewed without reading the implementation first.
